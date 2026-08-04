@@ -1,0 +1,8 @@
+output/
+videos.txt
+archive.txt
+__pycache__/
+node_modules/
+.env
+*.db
+venv/

@@ -1,0 +1,6 @@
+{
+  "name": "yt-archive-seed",
+  "private": true,
+  "dependencies": { "@nadimtuhin/ytranscript": "^1.2.0" },
+  "scripts": { "transcripts": "ytranscript bulk --file videos.txt --out-jsonl output/transcripts.jsonl --concurrency 2" }
+}
