@@ -139,6 +139,7 @@ def search(db_path: Path, query: str, search_type: str = "summaries", playlist: 
     if limit > 200:
         logger.warning(f"Limit {limit} too large, capping to 200")
         limit = 200
+    offset = max(0, offset)
 
     results: List[Dict[str, Any]] = []
 
@@ -146,6 +147,8 @@ def search(db_path: Path, query: str, search_type: str = "summaries", playlist: 
         with db_connection(db_path) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
+            # Match tags before pagination, using the same parser as displayed results.
+            conn.create_function("has_tag", 2, lambda raw, wanted: int(wanted.lower() in parse_tags_field(raw)))
 
             # Build base query with JOIN for playlist to avoid N+1
             # We also apply min_quality early
@@ -188,6 +191,9 @@ def search(db_path: Path, query: str, search_type: str = "summaries", playlist: 
                 if min_quality and min_quality > 0:
                     where_clauses.append("v.quality_score >= ?")
                     sql_params.append(min_quality)
+                if tag:
+                    where_clauses.append("has_tag(v.tags, ?) = 1")
+                    sql_params.append(tag)
 
                 where_sql = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
                 sql = f"SELECT {base_select} FROM {fts_table} {join_clause}{where_sql} ORDER BY {rank_order} LIMIT ? OFFSET ?"
@@ -223,12 +229,20 @@ def search(db_path: Path, query: str, search_type: str = "summaries", playlist: 
                     if min_quality and min_quality > 0:
                         fallback_where.append("v.quality_score >= ?")
                         fallback_params.append(min_quality)
+                    if tag:
+                        fallback_where.append("has_tag(v.tags, ?) = 1")
+                        fallback_params.append(tag)
 
                     like_pattern = f"%{query}%"
                     if search_type == "summaries":
                         fallback_where.append("v.summary LIKE ?")
                         fallback_params.append(like_pattern)
                         base_sql = f"SELECT v.* FROM videos v {fallback_join}"
+                    elif search_type == "transcripts":
+                        fallback_join += " JOIN transcripts t ON t.video_id=v.video_id"
+                        fallback_where.append("t.text LIKE ?")
+                        fallback_params.append(like_pattern)
+                        base_sql = f"SELECT v.*, t.text FROM videos v {fallback_join}"
                     else:
                         fallback_where.append("(v.title LIKE ? OR v.summary LIKE ? OR v.description LIKE ?)")
                         fallback_params.extend([like_pattern, like_pattern, like_pattern])
@@ -246,17 +260,8 @@ def search(db_path: Path, query: str, search_type: str = "summaries", playlist: 
     except sqlite3.Error as e:
         logger.error(f"Search DB error: {e}")
         print(f"FTS search failed {e}, fallback LIKE", file=sys.stderr)
-        # last resort simple LIKE without filters
-        try:
-            with db_connection(db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                cur = conn.cursor()
-                cur.execute("SELECT * FROM videos WHERE title LIKE ? OR summary LIKE ? OR description LIKE ? LIMIT ? OFFSET ?",
-                            (f"%{query}%", f"%{query}%", f"%{query}%", limit, offset))
-                results = [dict(r) for r in cur.fetchall()]
-        except sqlite3.Error as e2:
-            logger.error(f"Fallback also failed: {e2}")
-            return []
+        # Do not return unrelated data by silently dropping the requested filters.
+        return []
 
     # Tag filter - exact membership, not substring
     if tag:
@@ -291,7 +296,7 @@ def main() -> int:
     if not db_path.is_absolute():
         db_path = Path.cwd() / db_path
 
-    if args.stats or not args.query:
+    if args.stats or (not args.query and not args.rag):
         print_stats(db_path)
         if not args.query:
             print("\nExamples:")

@@ -1,0 +1,10 @@
+# Core (required)
+youtube-transcript-api>=1.2.0   # 1.x API: YouTubeTranscriptApi().fetch(...)
+yt-dlp>=2026.1.1                # playlist enumeration (flat, no video download)
+fastembed>=0.7.0               # local ONNX/CPU embeddings, no cloud
+sqlite-vec>=0.1.9              # vector KNN inside SQLite (Apache/MIT)
+
+# Optional: local Whisper fallback for caption-disabled videos
+# faster-whisper>=1.0.0        # also needs ffmpeg on PATH
+
+# Optional: RAG answer synthesis uses a LOCAL Ollama server (no python dep)

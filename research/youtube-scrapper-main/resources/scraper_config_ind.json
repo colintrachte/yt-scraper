@@ -1,0 +1,47 @@
+{
+  "proxy": {
+    "enabled": false,
+    "provider": "brightdata",
+    "country": "in",
+    "sticky": true,
+    "sticky_ttl_minutes": 10
+  },
+  "categories": [
+    "gaming",
+    "tech",
+    "beauty",
+    "fashion",
+    "fitness",
+    "food",
+    "travel",
+    "music",
+    "education",
+    "comedy",
+    "lifestyle",
+    "cooking",
+    "diy",
+    "art",
+    "finance",
+    "health",
+    "entertainment"
+  ],
+  "locations": [
+    "India",
+    "Mumbai",
+    "Delhi",
+    "Bangalore",
+    "Hyderabad",
+    "Chennai",
+    "Kolkata",
+    "Pune",
+    "Ahmedabad",
+    "Jaipur"
+  ],
+  "max_videos_to_scrape": 6,
+  "headless": false,
+  "results_per_search": 20,
+  "search_delay": [3, 7],
+  "scrape_delay": [2, 5],
+  "rate_limit_wait": 60,
+  "max_retries": 3
+}

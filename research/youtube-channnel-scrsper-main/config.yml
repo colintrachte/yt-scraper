@@ -1,0 +1,35 @@
+min_subscribers : 1000
+max_subscribers : 100000
+region_code : "IN"
+searching_keyword : 'doreamon'
+channel_views : 20000
+videos_count : 1
+start_date : "01/01/2020"
+end_date : "01/09/2025"
+api_keys:
+  - "xysabeigcshh"
+  - "xysabeigcshh"
+  - "xysabeigcshh"
+  - "Axysabeigcshh"
+  - "AIxxysabeigcshhILo"
+  - "AIxysabeigcshho"
+  - "Axysabeigcshxysabeigcshhk"
+  - "Axysabeigcshh"
+keyword_expansion: true
+max_expanded_keywords: 1  # Reduced to save quota
+analyze_recent_videos: 0  # Set to 0 to skip recent video analysis (useful for dead channels)
+save_per_keyword: false
+
+# YouTube Autocomplete API Configuration with Quota Management
+youtube_autocomplete:
+  enabled: false  # Disabled to save quota
+  max_suggestions: 5  # Reduced
+  max_long_tail_variations: 3  # Reduced
+  include_long_tail: false  # Disabled to save quota
+  delay_between_requests: 2.0  # Increased delay
+  
+  # Quota Management Settings
+  cache_duration_hours: 24  # Cache results for 24 hours to reduce API calls
+  max_requests_per_minute: 5  # Reduced rate limit
+  use_alternative_sources: false  # Disabled to save quota
+  fallback_to_static: true  # Use static fallback when quota is exhausted

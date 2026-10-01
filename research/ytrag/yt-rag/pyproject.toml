@@ -1,0 +1,21 @@
+[project]
+name = "ytrag"
+version = "0.1.0"
+description = "Local-first YouTube transcript harvester + hybrid RAG search engine"
+requires-python = ">=3.9"
+dependencies = [
+    "youtube-transcript-api>=1.2.0",
+    "yt-dlp>=2026.1.1",
+    "fastembed>=0.7.0",
+    "sqlite-vec>=0.1.9",
+]
+
+[project.optional-dependencies]
+whisper = ["faster-whisper>=1.0.0"]
+
+[project.scripts]
+ytrag = "ytrag.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

@@ -2,3 +2,4 @@ yt-dlp
 youtube-transcript-api
 youtube-comment-downloader
 tqdm
+requests

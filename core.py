@@ -9,9 +9,11 @@ core.py - Refactored knowledgebase core
 """
 from __future__ import annotations
 import json
+import html
 import logging
 import math
 import os
+import random
 import re
 import sqlite3
 import time
@@ -36,8 +38,29 @@ ProgressCb = Optional[Callable[[str], None]]
 CancelCheck = Optional[Callable[[], bool]]
 
 # ---------------------------------------------------------------------------
-# Config - env overrides
+# Config & Pacing Profiles
 # ---------------------------------------------------------------------------
+PACING_PROFILES = {
+    "conservative": {
+        "discovery": (1.5, 3.0),
+        "metadata": (1.5, 3.5),
+        "transcripts": (2.0, 4.5),
+        "comments": (2.5, 5.0),
+    },
+    "normal": {
+        "discovery": (1.0, 2.0),
+        "metadata": (1.0, 2.5),
+        "transcripts": (1.5, 3.0),
+        "comments": (1.5, 3.0),
+    },
+    "fast": {
+        "discovery": (0.5, 1.2),
+        "metadata": (0.5, 1.2),
+        "transcripts": (0.8, 1.5),
+        "comments": (1.0, 2.0),
+    },
+}
+
 @dataclass
 class AppConfig:
     out_dir: Path = field(default_factory=lambda: Path(os.getenv("YTK_OUT_DIR", "output")))
@@ -52,9 +75,26 @@ class AppConfig:
     request_timeout: int = int(os.getenv("YTK_TIMEOUT", "300"))
     llm_retries: int = int(os.getenv("YTK_LLM_RETRIES", "3"))
 
+    # Rate limiting & Anti-blocking settings
+    pacing_mode: str = os.getenv("YTK_PACING_MODE", "conservative")
+    chunk_size: int = int(os.getenv("YTK_CHUNK_SIZE", "25"))
+    chunk_pause_sec: float = float(os.getenv("YTK_CHUNK_PAUSE", "30.0"))
+    max_retries: int = int(os.getenv("YTK_MAX_RETRIES", "3"))
+    backoff_base_sec: float = float(os.getenv("YTK_BACKOFF_BASE", "5.0"))
+    backoff_max_sec: float = float(os.getenv("YTK_BACKOFF_MAX", "60.0"))
+    circuit_breaker_threshold: int = int(os.getenv("YTK_CIRCUIT_BREAKER", "4"))
+    circuit_breaker_pause_sec: float = float(os.getenv("YTK_CB_PAUSE", "90.0"))
+    cookies_file: Optional[str] = os.getenv("YTK_COOKIES_FILE", None)
+    cookies_browser: Optional[str] = os.getenv("YTK_COOKIES_BROWSER", None)
+    proxy: Optional[str] = os.getenv("YTK_PROXY", None)
+
     @property
     def db_path(self) -> Path:
         return Path(self.out_dir) / self.db_name
+
+    def get_pacing_range(self, service: str) -> Tuple[float, float]:
+        profile = PACING_PROFILES.get(self.pacing_mode.lower(), PACING_PROFILES["conservative"])
+        return profile.get(service, (2.0, 4.0))
 
 CONFIG = AppConfig()
 
@@ -170,6 +210,124 @@ def _log(msg: str, cb: ProgressCb = None) -> None:
         except Exception as e:
             logger.debug(f"progress_cb failed: {e}")
 
+# ---------------------------------------------------------------------------
+# Rate Limiting & Throttling
+# ---------------------------------------------------------------------------
+def is_rate_limit_error(e: Exception) -> bool:
+    """Detects YouTube throttling, HTTP 429, RequestBlocked, IpBlocked, or bot detection."""
+    msg = str(e).lower()
+    err_cls = e.__class__.__name__.lower()
+    patterns = [
+        "429", "too many requests", "requestblocked", "ipblocked",
+        "bot", "captcha", "confirm you're not a bot", "potoken",
+        "rate limit", "temporarily blocked", "throttled", "quotaexceeded"
+    ]
+    return any(p in msg or p in err_cls for p in patterns)
+
+def is_permanent_transcript_error(e: Exception) -> bool:
+    """Detects errors where transcripts simply do not exist or are disabled (non-retryable)."""
+    msg = str(e).lower()
+    err_cls = e.__class__.__name__.lower()
+    permanent_patterns = [
+        "notranscriptfound", "transcriptsdisabled", "videounavailable",
+        "videounplayable", "subtitles are disabled", "no transcript available"
+    ]
+    return any(p in msg or p in err_cls for p in permanent_patterns)
+
+def get_ydl_opts(base_opts: Optional[Dict[str, Any]] = None, config: Optional[AppConfig] = None) -> Dict[str, Any]:
+    """Applies proxy and cookie configurations to yt-dlp options."""
+    opts = base_opts.copy() if base_opts else {}
+    cfg = config or CONFIG
+    if cfg.cookies_browser:
+        opts["cookiesfrombrowser"] = (cfg.cookies_browser, None, None, None)
+    elif cfg.cookies_file and Path(cfg.cookies_file).exists():
+        opts["cookiefile"] = str(Path(cfg.cookies_file).resolve())
+    if cfg.proxy:
+        opts["proxy"] = cfg.proxy
+    return opts
+
+class AdaptiveThrottler:
+    """
+    Manages request pacing with jitter, exponential backoff on 429/blocks,
+    circuit breaker cooldowns, and chunk rest pauses.
+    """
+    def __init__(self,
+                 service_name: str,
+                 pacing_range: Tuple[float, float] = (2.0, 4.0),
+                 chunk_size: int = 25,
+                 chunk_pause_sec: float = 30.0,
+                 max_retries: int = 3,
+                 backoff_base_sec: float = 5.0,
+                 backoff_max_sec: float = 60.0,
+                 circuit_breaker_threshold: int = 4,
+                 circuit_breaker_pause_sec: float = 90.0):
+        self.service_name = service_name
+        self.min_delay, self.max_delay = pacing_range
+        self.chunk_size = chunk_size
+        self.chunk_pause_sec = chunk_pause_sec
+        self.max_retries = max_retries
+        self.backoff_base_sec = backoff_base_sec
+        self.backoff_max_sec = backoff_max_sec
+        self.circuit_breaker_threshold = circuit_breaker_threshold
+        self.circuit_breaker_pause_sec = circuit_breaker_pause_sec
+        self.processed_count = 0
+        self.consecutive_blocks = 0
+
+    def sleep_interruptible(self, duration: float, cancel_check: CancelCheck = None,
+                            progress_cb: ProgressCb = None, message: str = "") -> bool:
+        """Sleeps in small slices (0.25s) so cancel_check is promptly honored."""
+        if duration <= 0:
+            return True
+        if message and progress_cb:
+            _log(message, progress_cb)
+        step = 0.25
+        elapsed = 0.0
+        while elapsed < duration:
+            if cancel_check and cancel_check():
+                return False
+            time.sleep(min(step, duration - elapsed))
+            elapsed += step
+        return True
+
+    def pace(self, cancel_check: CancelCheck = None, progress_cb: ProgressCb = None) -> bool:
+        """Applies random jittered pacing delay and periodic chunk rest pauses."""
+        self.processed_count += 1
+        if self.chunk_size > 0 and (self.processed_count % self.chunk_size == 0):
+            msg = f"[{self.service_name} cooldown] Processed {self.processed_count} items; resting for {self.chunk_pause_sec:.1f}s to avoid rate limits..."
+            if not self.sleep_interruptible(self.chunk_pause_sec, cancel_check, progress_cb, msg):
+                return False
+
+        delay = random.uniform(self.min_delay, self.max_delay)
+        return self.sleep_interruptible(delay, cancel_check)
+
+    def record_success(self) -> None:
+        """Resets consecutive blocks counter on a successful operation."""
+        self.consecutive_blocks = 0
+
+    def calculate_backoff(self, attempt: int, retry_after: Optional[float] = None) -> float:
+        """Computes exponential backoff with full jitter, honoring Retry-After if present."""
+        if retry_after is not None and retry_after > 0:
+            return retry_after + random.uniform(0.5, 2.0)
+        delay = min(self.backoff_max_sec, self.backoff_base_sec * (2 ** attempt))
+        jitter = random.uniform(0.5, 2.5)
+        return delay + jitter
+
+    def handle_rate_limit(self, attempt: int, error_msg: str, cancel_check: CancelCheck = None,
+                          progress_cb: ProgressCb = None, retry_after: Optional[float] = None) -> bool:
+        """Handles a rate-limit event, applying backoff and checking circuit breaker."""
+        self.consecutive_blocks += 1
+        if self.circuit_breaker_threshold > 0 and self.consecutive_blocks >= self.circuit_breaker_threshold:
+            pause_time = self.circuit_breaker_pause_sec
+            msg = (f"[{self.service_name} CIRCUIT BREAKER] {self.consecutive_blocks} consecutive rate limits detected! "
+                   f"Cooling down for {pause_time:.0f}s to protect IP...")
+            self.consecutive_blocks = 0
+            return self.sleep_interruptible(pause_time, cancel_check, progress_cb, msg)
+
+        backoff_sec = self.calculate_backoff(attempt, retry_after)
+        short_err = error_msg[:80] + "..." if len(error_msg) > 80 else error_msg
+        msg = f"[{self.service_name} 429/throttle] {short_err} -> retry {attempt + 1}/{self.max_retries} after {backoff_sec:.1f}s"
+        return self.sleep_interruptible(backoff_sec, cancel_check, progress_cb, msg)
+
 def safe_json_loads(s: str, default: Any = None) -> Any:
     try:
         return json.loads(s) if s else default
@@ -196,6 +354,22 @@ def parse_tags_field(raw: Any) -> List[str]:
         # If raw is like '["python", "ai"]' failed above, we still try to split
         return [raw.lower()] if raw else []
     return []
+
+
+def highlight_search_snippet(snippet: str, query: str) -> str:
+    """Render untrusted source text safely with only our own highlight markup."""
+    terms = sorted({term for term in query.split() if len(term) >= 2}, key=len, reverse=True)
+    if not terms:
+        return html.escape(snippet)
+    pattern = re.compile("|".join(re.escape(term) for term in terms), re.IGNORECASE)
+    parts = []
+    previous = 0
+    for match in pattern.finditer(snippet):
+        parts.append(html.escape(snippet[previous:match.start()]))
+        parts.append("<mark>" + html.escape(match.group()) + "</mark>")
+        previous = match.end()
+    parts.append(html.escape(snippet[previous:]))
+    return "".join(parts)
 
 # ---------------------------------------------------------------------------
 # JSONL helpers - append-only with deduplication
@@ -402,8 +576,10 @@ def read_preserved_user_data(db_path: Path) -> Tuple[Dict[str, Dict], Dict[str, 
 # Discovery
 # ---------------------------------------------------------------------------
 def get_playlist_data(url: str, limit: int = 0, progress_cb: ProgressCb = None,
-                      cancel_check: CancelCheck = None) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+                      cancel_check: CancelCheck = None, config: Optional[AppConfig] = None,
+                      throttler: Optional[AdaptiveThrottler] = None) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     import yt_dlp
+    cfg = config or CONFIG
     _log(f"Fetching: {url}", progress_cb)
     v_id, p_id = extract_ids_from_url(url)
     _log(f"Parsed -> video={v_id} playlist={p_id}", progress_cb)
@@ -420,14 +596,19 @@ def get_playlist_data(url: str, limit: int = 0, progress_cb: ProgressCb = None,
         if cancel_check and cancel_check():
             logger.info("Discovery cancelled")
             break
+        if throttler and not throttler.pace(cancel_check, progress_cb):
+            logger.info("Discovery cancelled during pacing")
+            break
         is_playlist_attempt = any(x in attempt_url for x in ("playlist?list=", "/@", "/channel/", "/c/", "/user/")) or (p_id and p_id in attempt_url)
-        ydl_opts = {"extract_flat": True, "quiet": True, "skip_download": True, "ignoreerrors": True,
-                    "no_warnings": True, "yes_playlist": is_playlist_attempt}
+        ydl_opts = get_ydl_opts({"extract_flat": True, "quiet": True, "skip_download": True, "ignoreerrors": True,
+                                "no_warnings": True, "yes_playlist": is_playlist_attempt}, cfg)
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(attempt_url, download=False)
                 if not info:
                     continue
+                if throttler:
+                    throttler.record_success()
                 playlist_id = info.get("id") if is_playlist_attempt else p_id
                 if "entries" in info and info.get("entries") is not None:
                     if not playlist_id:
@@ -507,16 +688,33 @@ def get_playlist_data(url: str, limit: int = 0, progress_cb: ProgressCb = None,
 # Full metadata - failure log opened once per batch
 # ---------------------------------------------------------------------------
 def fetch_videos_full_metadata(video_ids: List[str], out_path: Path, progress_cb: ProgressCb = None,
-                               resume: bool = True, sleep_sec: float = 0.3,
-                               cancel_check: CancelCheck = None) -> None:
+                               resume: bool = True, sleep_sec: float = 1.5,
+                               cancel_check: CancelCheck = None,
+                               throttler: Optional[AdaptiveThrottler] = None,
+                               config: Optional[AppConfig] = None) -> None:
     import yt_dlp
+    cfg = config or CONFIG
+    if throttler is None:
+        pacing = cfg.get_pacing_range("metadata")
+        throttler = AdaptiveThrottler(
+            service_name="metadata",
+            pacing_range=pacing,
+            chunk_size=cfg.chunk_size,
+            chunk_pause_sec=cfg.chunk_pause_sec,
+            max_retries=cfg.max_retries,
+            backoff_base_sec=cfg.backoff_base_sec,
+            backoff_max_sec=cfg.backoff_max_sec,
+            circuit_breaker_threshold=cfg.circuit_breaker_threshold,
+            circuit_breaker_pause_sec=cfg.circuit_breaker_pause_sec
+        )
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     existing = read_existing_ids_jsonl(out_path, key="id") if resume else set()
     mode = "a" if resume and out_path.exists() else "w"
     failures_path = out_path.parent / "failed_metadata.jsonl"
     ok = 0
-    ydl_opts = {"quiet": True, "skip_download": True, "ignoreerrors": True, "no_warnings": True, "no_playlist": True}
+    ydl_opts = get_ydl_opts({"quiet": True, "skip_download": True, "ignoreerrors": True, "no_warnings": True, "no_playlist": True}, cfg)
 
     with open(out_path, mode, encoding="utf-8") as f_out, open(failures_path, "a", encoding="utf-8") as f_fail:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -528,110 +726,224 @@ def fetch_videos_full_metadata(video_ids: List[str], out_path: Path, progress_cb
                     continue
                 if vid in existing:
                     continue
-                try:
-                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-                    if not info:
-                        raise ValueError("No info")
-                    rec = {
-                        "id": vid,
-                        "title": info.get("title") or "",
-                        "fulltitle": info.get("fulltitle") or "",
-                        "description": info.get("description") or "",
-                        "tags": info.get("tags") or [],
-                        "categories": info.get("categories") or [],
-                        "channel": info.get("channel") or "",
-                        "channel_id": info.get("channel_id") or "",
-                        "channel_url": info.get("channel_url") or "",
-                        "uploader": info.get("uploader") or "",
-                        "uploader_id": info.get("uploader_id") or "",
-                        "upload_date": info.get("upload_date") or "",
-                        "timestamp": info.get("timestamp") or 0,
-                        "duration": info.get("duration") or 0,
-                        "view_count": info.get("view_count") or 0,
-                        "like_count": info.get("like_count") or 0,
-                        "comment_count": info.get("comment_count") or 0,
-                        "thumbnail": info.get("thumbnail") or "",
-                        "language": info.get("language") or "",
-                        "chapters": info.get("chapters") or [],
-                        "url": f"https://www.youtube.com/watch?v={vid}",
-                    }
-                    f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    f_out.flush()
-                    ok += 1
-                    _log(f"[meta OK] {vid} tags={len(rec['tags'])}", progress_cb)
-                except Exception as e:
-                    f_fail.write(json.dumps({"video_id": vid, "type": "metadata", "error": str(e), "url": f"https://www.youtube.com/watch?v={vid}"}, ensure_ascii=False) + "\n")
-                    f_fail.flush()
-                    _log(f"[meta FAIL] {vid}: {e}", progress_cb)
-                time.sleep(sleep_sec)
+
+                if not throttler.pace(cancel_check, progress_cb):
+                    logger.info("Metadata fetch cancelled during pacing")
+                    break
+
+                for attempt in range(throttler.max_retries + 1):
+                    try:
+                        info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+                        if not info:
+                            raise ValueError("No info returned by yt-dlp")
+                        rec = {
+                            "id": vid,
+                            "title": info.get("title") or "",
+                            "fulltitle": info.get("fulltitle") or "",
+                            "description": info.get("description") or "",
+                            "tags": info.get("tags") or [],
+                            "categories": info.get("categories") or [],
+                            "channel": info.get("channel") or "",
+                            "channel_id": info.get("channel_id") or "",
+                            "channel_url": info.get("channel_url") or "",
+                            "uploader": info.get("uploader") or "",
+                            "uploader_id": info.get("uploader_id") or "",
+                            "upload_date": info.get("upload_date") or "",
+                            "timestamp": info.get("timestamp") or 0,
+                            "duration": info.get("duration") or 0,
+                            "view_count": info.get("view_count") or 0,
+                            "like_count": info.get("like_count") or 0,
+                            "comment_count": info.get("comment_count") or 0,
+                            "thumbnail": info.get("thumbnail") or "",
+                            "language": info.get("language") or "",
+                            "chapters": info.get("chapters") or [],
+                            "url": f"https://www.youtube.com/watch?v={vid}",
+                        }
+                        f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        f_out.flush()
+                        ok += 1
+                        throttler.record_success()
+                        _log(f"[meta OK] {vid} tags={len(rec['tags'])}", progress_cb)
+                        break
+                    except Exception as e:
+                        if attempt < throttler.max_retries and is_rate_limit_error(e):
+                            if not throttler.handle_rate_limit(attempt, str(e), cancel_check=cancel_check, progress_cb=progress_cb):
+                                logger.info("Metadata fetch cancelled during backoff")
+                                return
+                        else:
+                            f_fail.write(json.dumps({"video_id": vid, "type": "metadata", "error": str(e), "url": f"https://www.youtube.com/watch?v={vid}"}, ensure_ascii=False) + "\n")
+                            f_fail.flush()
+                            _log(f"[meta FAIL] {vid}: {e}", progress_cb)
+                            break
     _log(f"Full metadata: {ok} -> {out_path}", progress_cb)
 
 # ---------------------------------------------------------------------------
-# Transcripts - fixed version detection, single failure log handle
+# Transcripts - Multi-tier retrieval (Primary API + yt-dlp caption fallback)
 # ---------------------------------------------------------------------------
-def _fetch_one_transcript_new_api(vid: str):
-    """Try new API surface explicitly."""
-    from youtube_transcript_api import YouTubeTranscriptApi
-    api = YouTubeTranscriptApi()
-    # new API has .list() method
-    if hasattr(api, "list"):
-        t_list = api.list(vid)
-    else:
-        # very old fallback
-        t_list = YouTubeTranscriptApi.list_transcripts(vid)
+def _fetch_transcript_ytdlp_fallback(vid: str, config: Optional[AppConfig] = None) -> Tuple[str, List[Dict[str, Any]], str]:
+    """Fallback transcript extraction using yt-dlp subtitles and automatic captions (timedtext json3)."""
+    import yt_dlp
+    import requests
 
-    transcript_obj = None
+    cfg = config or CONFIG
+    ydl_opts = get_ydl_opts({"quiet": True, "skip_download": True, "ignoreerrors": True, "no_warnings": True, "no_playlist": True}, cfg)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+    if not info:
+        raise ValueError(f"yt-dlp could not extract info for {vid}")
+
+    subs = info.get("subtitles") or {}
+    auto = info.get("automatic_captions") or {}
+
+    pref_langs = ["en", "en-US", "en-GB"]
+    chosen_sub = None
+    lang_code = "en"
+
+    for l in pref_langs:
+        if l in subs and subs[l]:
+            chosen_sub = subs[l]
+            lang_code = l
+            break
+    if not chosen_sub:
+        for l in pref_langs:
+            if l in auto and auto[l]:
+                chosen_sub = auto[l]
+                lang_code = l
+                break
+    if not chosen_sub and subs:
+        first_lang = next(iter(subs))
+        chosen_sub = subs[first_lang]
+        lang_code = first_lang
+    if not chosen_sub and auto:
+        first_lang = next(iter(auto))
+        chosen_sub = auto[first_lang]
+        lang_code = first_lang
+
+    if not chosen_sub:
+        raise ValueError(f"No subtitles or automatic captions available in yt-dlp for {vid}")
+
+    fmt = next((x for x in chosen_sub if x.get("ext") == "json3"), chosen_sub[0])
+    sub_url = fmt.get("url")
+    if not sub_url:
+        raise ValueError(f"No subtitle URL found in yt-dlp stream for {vid}")
+
+    session = requests.Session()
+    if cfg.proxy:
+        session.proxies = {"http": cfg.proxy, "https": cfg.proxy}
+    resp = session.get(sub_url, timeout=25)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Failed to fetch subtitle stream from {sub_url}: HTTP {resp.status_code}")
+
+    data = resp.json()
+    events = data.get("events") or []
+    segs = []
+    full_text = []
+    for ev in events:
+        t_start = ev.get("tStartMs", 0) / 1000.0
+        t_dur = ev.get("dDurationMs", 0) / 1000.0
+        ev_segs = ev.get("segs") or []
+        txt = "".join(s.get("utf8", "") for s in ev_segs).strip()
+        if txt and txt != "\n":
+            segs.append({"text": txt, "start": float(t_start), "duration": float(t_dur)})
+            full_text.append(txt)
+
+    if not segs:
+        raise ValueError(f"Subtitle stream for {vid} contained no text segments")
+
+    return " ".join(full_text), segs, lang_code
+
+def _fetch_one_transcript_primary(vid: str, config: Optional[AppConfig] = None) -> Tuple[str, List[Dict[str, Any]], str]:
+    """Primary transcript extraction using youtube_transcript_api 1.2+."""
+    from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api.proxies import GenericProxyConfig
+    cfg = config or CONFIG
+    proxy_cfg = None
+    if cfg.proxy:
+        proxy_cfg = GenericProxyConfig(http_url=cfg.proxy, https_url=cfg.proxy)
+    api = YouTubeTranscriptApi(proxy_config=proxy_cfg)
+
+    raw = None
+    lang = "en"
     for langs in (["en", "en-US", "en-GB"], ["en"], None):
         try:
             if langs is None:
-                # pick first
+                t_list = api.list(vid)
                 items = list(t_list)
                 if items:
-                    transcript_obj = items[0]
+                    t_obj = items[0]
+                    fetched = t_obj.fetch()
+                    raw = fetched.to_raw_data() if hasattr(fetched, "to_raw_data") else fetched
+                    lang = getattr(t_obj, "language_code", "en")
+                    break
+                else:
+                    raise ValueError("No transcript items in list")
             else:
-                try:
-                    transcript_obj = t_list.find_transcript(langs)
-                except Exception:
-                    transcript_obj = t_list.find_generated_transcript(langs)
-            if transcript_obj:
+                fetched = api.fetch(vid, languages=langs)
+                raw = fetched.to_raw_data() if hasattr(fetched, "to_raw_data") else fetched
+                lang = getattr(fetched, "language_code", langs[0])
                 break
-        except Exception:
+        except Exception as e:
+            if is_rate_limit_error(e):
+                raise
             continue
-    if not transcript_obj:
-        raise ValueError("No transcript found via new API")
-    fetched = transcript_obj.fetch()
+    else:
+        raise ValueError(f"No transcript found via primary API for {vid}")
+
     segs = []
     full = []
-    for x in fetched:
-        if hasattr(x, "text"):
-            txt, st, du = x.text, getattr(x, "start", 0), getattr(x, "duration", 0)
+    for item in raw or []:
+        if isinstance(item, dict):
+            txt = item.get("text", "")
+            st = float(item.get("start", 0))
+            du = float(item.get("duration", 0))
         else:
-            txt, st, du = x.get("text", ""), x.get("start", 0), x.get("duration", 0)
-        segs.append({"text": txt, "start": float(st), "duration": float(du)})
-        full.append(txt)
-    return " ".join(full), segs, getattr(transcript_obj, "language_code", "en")
+            txt = getattr(item, "text", "")
+            st = float(getattr(item, "start", 0))
+            du = float(getattr(item, "duration", 0))
+        if txt:
+            segs.append({"text": txt, "start": st, "duration": du})
+            full.append(txt)
 
-def _fetch_one_transcript_old_api(vid: str):
-    from youtube_transcript_api import YouTubeTranscriptApi
-    data = YouTubeTranscriptApi.get_transcript(vid, languages=["en", "en-US"])
-    segs = [{"text": d["text"], "start": d["start"], "duration": d["duration"]} for d in data]
-    return " ".join(d["text"] for d in data), segs, "en"
+    return " ".join(full), segs, lang
 
-def _fetch_one_transcript(vid: str):
+def _fetch_one_transcript(vid: str, config: Optional[AppConfig] = None) -> Tuple[str, List[Dict[str, Any]], str]:
+    """Attempts primary transcript API, then seamlessly falls back to yt-dlp caption extraction."""
     if not is_valid_video_id(vid):
         raise ValueError(f"Invalid video ID {vid}")
+    primary_err = None
     try:
-        return _fetch_one_transcript_new_api(vid)
-    except Exception as e_new:
-        logger.debug(f"New transcript API failed for {vid}: {e_new}, trying old API")
-        try:
-            return _fetch_one_transcript_old_api(vid)
-        except Exception as e_old:
-            raise RuntimeError(f"Both transcript APIs failed: new={e_new} old={e_old}") from e_old
+        return _fetch_one_transcript_primary(vid, config=config)
+    except Exception as e:
+        primary_err = e
+        if is_permanent_transcript_error(e):
+            raise
+        logger.debug(f"Primary transcript API failed for {vid} ({e}), trying yt-dlp subtitle fallback...")
+
+    try:
+        return _fetch_transcript_ytdlp_fallback(vid, config=config)
+    except Exception as e_fallback:
+        raise RuntimeError(f"Both transcript extraction methods failed: primary={primary_err} fallback={e_fallback}") from e_fallback
 
 def fetch_transcripts_bulk(video_infos: List[Dict], out_path: Path, resume: bool = True,
-                           progress_cb: ProgressCb = None, sleep_sec: float = 0.6,
-                           cancel_check: CancelCheck = None) -> None:
+                           progress_cb: ProgressCb = None, sleep_sec: float = 2.0,
+                           cancel_check: CancelCheck = None,
+                           throttler: Optional[AdaptiveThrottler] = None,
+                           config: Optional[AppConfig] = None) -> None:
+    cfg = config or CONFIG
+    if throttler is None:
+        pacing = cfg.get_pacing_range("transcripts")
+        throttler = AdaptiveThrottler(
+            service_name="transcripts",
+            pacing_range=pacing,
+            chunk_size=cfg.chunk_size,
+            chunk_pause_sec=cfg.chunk_pause_sec,
+            max_retries=cfg.max_retries,
+            backoff_base_sec=cfg.backoff_base_sec,
+            backoff_max_sec=cfg.backoff_max_sec,
+            circuit_breaker_threshold=cfg.circuit_breaker_threshold,
+            circuit_breaker_pause_sec=cfg.circuit_breaker_pause_sec
+        )
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     existing = read_existing_ids_jsonl(out_path, key="video_id") if resume else set()
@@ -650,22 +962,44 @@ def fetch_transcripts_bulk(video_infos: List[Dict], out_path: Path, resume: bool
             if vid in existing:
                 skip += 1
                 continue
-            try:
-                full, segs, lang = _fetch_one_transcript(vid)
-                rec = {"video_id": vid, "title": info.get("title", ""), "url": info.get("url", ""), "channel": info.get("channel", ""), "channel_id": info.get("channel_id", ""), "language": lang, "text": full, "segments": segs}
-                f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                f_out.flush()
-                ok += 1
-                _log(f"[transcript OK] {vid}", progress_cb)
-            except Exception as e:
-                rec = {"video_id": vid, "title": info.get("title", ""), "url": info.get("url", ""), "error": str(e), "text": "", "segments": []}
-                f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                f_out.flush()
-                f_fail.write(json.dumps({"video_id": vid, "type": "transcript", "error": str(e), "url": info.get("url", ""), "title": info.get("title", "")}, ensure_ascii=False) + "\n")
-                f_fail.flush()
-                err += 1
-                _log(f"[transcript FAIL] {vid}: {e} -> flagged for manual review", progress_cb)
-            time.sleep(sleep_sec)
+
+            if not throttler.pace(cancel_check, progress_cb):
+                logger.info("Transcript fetch cancelled during pacing")
+                break
+
+            for attempt in range(throttler.max_retries + 1):
+                try:
+                    full, segs, lang = _fetch_one_transcript(vid, config=cfg)
+                    rec = {"video_id": vid, "title": info.get("title", ""), "url": info.get("url", ""), "channel": info.get("channel", ""), "channel_id": info.get("channel_id", ""), "language": lang, "text": full, "segments": segs}
+                    f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    f_out.flush()
+                    ok += 1
+                    throttler.record_success()
+                    _log(f"[transcript OK] {vid}", progress_cb)
+                    break
+                except Exception as e:
+                    if is_permanent_transcript_error(e):
+                        rec = {"video_id": vid, "title": info.get("title", ""), "url": info.get("url", ""), "error": str(e), "text": "", "segments": []}
+                        f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        f_out.flush()
+                        f_fail.write(json.dumps({"video_id": vid, "type": "transcript", "error": str(e), "url": info.get("url", ""), "title": info.get("title", "")}, ensure_ascii=False) + "\n")
+                        f_fail.flush()
+                        err += 1
+                        _log(f"[transcript NONE] {vid}: No transcripts available", progress_cb)
+                        break
+                    elif attempt < throttler.max_retries and is_rate_limit_error(e):
+                        if not throttler.handle_rate_limit(attempt, str(e), cancel_check=cancel_check, progress_cb=progress_cb):
+                            logger.info("Transcript fetch cancelled during backoff")
+                            return
+                    else:
+                        rec = {"video_id": vid, "title": info.get("title", ""), "url": info.get("url", ""), "error": str(e), "text": "", "segments": []}
+                        f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        f_out.flush()
+                        f_fail.write(json.dumps({"video_id": vid, "type": "transcript", "error": str(e), "url": info.get("url", ""), "title": info.get("title", "")}, ensure_ascii=False) + "\n")
+                        f_fail.flush()
+                        err += 1
+                        _log(f"[transcript FAIL] {vid}: {e} -> flagged for manual review", progress_cb)
+                        break
     _log(f"Transcripts: {ok} ok, {skip} skipped, {err} failed -> {out_path} + {failures_path}", progress_cb)
 
 # ---------------------------------------------------------------------------
@@ -673,6 +1007,8 @@ def fetch_transcripts_bulk(video_infos: List[Dict], out_path: Path, resume: bool
 # ---------------------------------------------------------------------------
 def fetch_comments_bulk(video_ids: List[str], out_path: Path, limit_per_video: int = 0,
                         resume: bool = True, progress_cb: ProgressCb = None,
+                        throttler: Optional[AdaptiveThrottler] = None,
+                        config: Optional[AppConfig] = None,
                         cancel_check: CancelCheck = None) -> None:
     try:
         from youtube_comment_downloader import YoutubeCommentDownloader
@@ -681,6 +1017,21 @@ def fetch_comments_bulk(video_ids: List[str], out_path: Path, limit_per_video: i
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text("", encoding="utf-8")
         return
+
+    cfg = config or CONFIG
+    if throttler is None:
+        pacing = cfg.get_pacing_range("comments")
+        throttler = AdaptiveThrottler(
+            service_name="comments",
+            pacing_range=pacing,
+            chunk_size=cfg.chunk_size,
+            chunk_pause_sec=cfg.chunk_pause_sec,
+            max_retries=cfg.max_retries,
+            backoff_base_sec=cfg.backoff_base_sec,
+            backoff_max_sec=cfg.backoff_max_sec,
+            circuit_breaker_threshold=cfg.circuit_breaker_threshold,
+            circuit_breaker_pause_sec=cfg.circuit_breaker_pause_sec
+        )
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -710,24 +1061,41 @@ def fetch_comments_bulk(video_ids: List[str], out_path: Path, limit_per_video: i
                 continue
             if resume and vid in existing_vids:
                 continue
-            try:
-                comments = downloader.get_comments_from_url(f"https://www.youtube.com/watch?v={vid}", sort_by=0)
-                c = 0
-                for cm in comments:
-                    text = cm.get("text", "")
-                    if not text:
-                        continue
-                    rec = {"video_id": vid, "author": cm.get("author", ""), "text": text, "votes": parse_vote_count(cm.get("votes")), "time": cm.get("time", "")}
-                    f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    total += 1
-                    c += 1
-                    if limit_per_video and c >= limit_per_video:
+
+            if not throttler.pace(cancel_check, progress_cb):
+                logger.info("Comments fetch cancelled during pacing")
+                break
+
+            for attempt in range(throttler.max_retries + 1):
+                try:
+                    comments = downloader.get_comments_from_url(f"https://www.youtube.com/watch?v={vid}", sort_by=0)
+                    c = 0
+                    for cm in comments:
+                        if cancel_check and cancel_check():
+                            break
+                        text = cm.get("text", "")
+                        if not text:
+                            continue
+                        rec = {"video_id": vid, "author": cm.get("author", ""), "text": text, "votes": parse_vote_count(cm.get("votes")), "time": cm.get("time", "")}
+                        f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        total += 1
+                        c += 1
+                        if limit_per_video and c >= limit_per_video:
+                            break
+                    f_out.flush()
+                    throttler.record_success()
+                    _log(f"[comments OK] {vid}: {c}", progress_cb)
+                    break
+                except Exception as e:
+                    if attempt < throttler.max_retries and is_rate_limit_error(e):
+                        if not throttler.handle_rate_limit(attempt, str(e), cancel_check=cancel_check, progress_cb=progress_cb):
+                            logger.info("Comments fetch cancelled during backoff")
+                            return
+                    else:
+                        f_fail.write(json.dumps({"video_id": vid, "type": "comments", "error": str(e), "url": f"https://www.youtube.com/watch?v={vid}"}, ensure_ascii=False) + "\n")
+                        f_fail.flush()
+                        _log(f"[comments FAIL] {vid}: {e}", progress_cb)
                         break
-                _log(f"[comments OK] {vid}: {c}", progress_cb)
-            except Exception as e:
-                f_fail.write(json.dumps({"video_id": vid, "type": "comments", "error": str(e), "url": f"https://www.youtube.com/watch?v={vid}"}, ensure_ascii=False) + "\n")
-                f_fail.flush()
-                _log(f"[comments FAIL] {vid}: {e}", progress_cb)
     _log(f"Comments done: {total} -> {out_path}", progress_cb)
 
 # ---------------------------------------------------------------------------
@@ -1001,8 +1369,8 @@ def build_db(out_dir: Path, db_path: Path, progress_cb: ProgressCb = None,
         # backup instead of unlink
         backup_path = db_path.with_suffix(".bak.db")
         try:
-            import shutil
-            shutil.copy2(db_path, backup_path)
+            with sqlite3.connect(str(db_path)) as source, sqlite3.connect(str(backup_path)) as destination:
+                source.backup(destination)
             logger.info(f"Backed up existing DB to {backup_path}")
         except Exception as e:
             logger.warning(f"Backup failed: {e}")
@@ -1097,7 +1465,7 @@ def build_db(out_dir: Path, db_path: Path, progress_cb: ProgressCb = None,
         for vid, j in all_vids.items():
             if cancel_check and cancel_check():
                 logger.info("DB build cancelled")
-                break
+                raise RuntimeError("DB build cancelled; database changes rolled back")
             try:
                 trans = transcript_map.get(vid)
                 cstats = comment_stats.get(vid)

@@ -72,7 +72,7 @@ try:
         get_playlist_data, fetch_videos_full_metadata, fetch_transcripts_bulk, fetch_comments_bulk, build_db,
         update_video_user_score, update_video_summary, get_video_copy_data, export_rag_dataset,
         batch_summarize, generate_summary_for_video, test_llm_connection, CONFIG, db_connection,
-        is_valid_video_id
+        is_valid_video_id, AppConfig, AdaptiveThrottler, PACING_PROFILES, is_rate_limit_error
     )
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent))
@@ -80,10 +80,11 @@ except ImportError:
         get_playlist_data, fetch_videos_full_metadata, fetch_transcripts_bulk, fetch_comments_bulk, build_db,
         update_video_user_score, update_video_summary, get_video_copy_data, export_rag_dataset,
         batch_summarize, generate_summary_for_video, test_llm_connection, CONFIG, db_connection,
-        is_valid_video_id
+        is_valid_video_id, AppConfig, AdaptiveThrottler, PACING_PROFILES, is_rate_limit_error
     )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+from core import highlight_search_snippet
 logger = logging.getLogger("ytkb.main")
 logger.setLevel(logging.INFO)
 
@@ -179,7 +180,7 @@ def validate_urls(urls: List[str]) -> Tuple[List[str], List[str]]:
         valid.append(u)
     return valid, invalid
 
-def discover_videos(url_list: List[str], limit: int, progress_cb: Callable[[str], None]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+def discover_videos(url_list: List[str], limit: int, progress_cb: Callable[[str], None], config: Optional[AppConfig] = None) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     all_videos_dict: Dict[str, Dict] = {}
     all_playlists_dict: Dict[str, Dict] = {}
     all_mappings: List[Dict] = []
@@ -190,7 +191,7 @@ def discover_videos(url_list: List[str], limit: int, progress_cb: Callable[[str]
             log("Cancelled during discovery")
             break
         set_stage("discovery", idx, len(url_list), f"Fetching {u[:60]}")
-        vids, pls, maps = get_playlist_data(u, limit=limit, progress_cb=progress_cb, cancel_check=is_cancelled)
+        vids, pls, maps = get_playlist_data(u, limit=limit, progress_cb=progress_cb, cancel_check=is_cancelled, config=config)
         for v in vids:
             if v["id"] not in all_videos_dict:
                 all_videos_dict[v["id"]] = v
@@ -217,7 +218,7 @@ def persist_discovery(videos: List[Dict], playlists: List[Dict], mappings: List[
         logger.error(f"Failed to persist discovery: {e}")
         raise
 
-def fetch_all_metadata(videos: List[Dict], out_dir: Path, skip: bool, cb: Callable[[str], None]) -> None:
+def fetch_all_metadata(videos: List[Dict], out_dir: Path, skip: bool, cb: Callable[[str], None], config: Optional[AppConfig] = None) -> None:
     if skip:
         log("Skipping full metadata")
         set_stage("metadata", 0, 0, "Skipped")
@@ -232,9 +233,11 @@ def fetch_all_metadata(videos: List[Dict], out_dir: Path, skip: bool, cb: Callab
                 counter["ok"] += 1
             set_stage("metadata", counter["done"], len(videos), msg)
             update_counts(metadata_ok=counter["ok"])
-    fetch_videos_full_metadata([v["id"] for v in videos], out_path=out_dir / "videos_full.jsonl", progress_cb=wrapped, resume=True, cancel_check=is_cancelled)
+        elif any(k in msg for k in ("[429/throttle]", "[cooldown]", "[CIRCUIT BREAKER]")):
+            set_stage("metadata", counter["done"], len(videos), msg)
+    fetch_videos_full_metadata([v["id"] for v in videos], out_path=out_dir / "videos_full.jsonl", progress_cb=wrapped, resume=True, cancel_check=is_cancelled, config=config)
 
-def fetch_all_transcripts(videos: List[Dict], out_dir: Path, skip: bool, cb: Callable[[str], None]) -> None:
+def fetch_all_transcripts(videos: List[Dict], out_dir: Path, skip: bool, cb: Callable[[str], None], config: Optional[AppConfig] = None) -> None:
     if skip:
         log("Skipping transcripts")
         set_stage("transcripts", 0, 0, "Skipped")
@@ -243,15 +246,17 @@ def fetch_all_transcripts(videos: List[Dict], out_dir: Path, skip: bool, cb: Cal
     counter = {"done": 0, "ok": 0}
     def wrapped(msg):
         cb(msg)
-        if "[transcript OK]" in msg or "[transcript FAIL]" in msg:
+        if "[transcript OK]" in msg or "[transcript FAIL]" in msg or "[transcript NONE]" in msg:
             counter["done"] += 1
             if "[transcript OK]" in msg:
                 counter["ok"] += 1
             set_stage("transcripts", counter["done"], len(videos), msg)
             update_counts(transcripts_ok=counter["ok"])
-    fetch_transcripts_bulk(videos, out_path=out_dir / "transcripts.jsonl", resume=True, progress_cb=wrapped, cancel_check=is_cancelled)
+        elif any(k in msg for k in ("[429/throttle]", "[cooldown]", "[CIRCUIT BREAKER]")):
+            set_stage("transcripts", counter["done"], len(videos), msg)
+    fetch_transcripts_bulk(videos, out_path=out_dir / "transcripts.jsonl", resume=True, progress_cb=wrapped, cancel_check=is_cancelled, config=config)
 
-def fetch_all_comments(videos: List[Dict], out_dir: Path, skip: bool, cb: Callable[[str], None]) -> None:
+def fetch_all_comments(videos: List[Dict], out_dir: Path, skip: bool, cb: Callable[[str], None], config: Optional[AppConfig] = None) -> None:
     if skip:
         log("Skipping comments")
         set_stage("comments", 0, 0, "Skipped")
@@ -264,7 +269,9 @@ def fetch_all_comments(videos: List[Dict], out_dir: Path, skip: bool, cb: Callab
             counter["done"] += 1
             set_stage("comments", counter["done"], len(videos), msg)
             update_counts(comments_ok=counter["done"])
-    fetch_comments_bulk([v["id"] for v in videos], out_path=out_dir / "comments.jsonl", resume=True, progress_cb=wrapped, cancel_check=is_cancelled)
+        elif any(k in msg for k in ("[429/throttle]", "[cooldown]", "[CIRCUIT BREAKER]")):
+            set_stage("comments", counter["done"], len(videos), msg)
+    fetch_comments_bulk([v["id"] for v in videos], out_path=out_dir / "comments.jsonl", resume=True, progress_cb=wrapped, cancel_check=is_cancelled, config=config)
 
 def build_database(out_dir: Path, cb: Callable[[str], None]) -> Dict[str, Any]:
     set_stage("database", 0, 1, "Building database")
@@ -277,7 +284,10 @@ def build_database(out_dir: Path, cb: Callable[[str], None]) -> Dict[str, Any]:
     return result
 
 def archive_job(urls_input: str, limit: int = 0, skip_comments: bool = False, skip_transcripts: bool = False,
-                skip_metadata: bool = False, out_dir: Path = Path("output")) -> None:
+                skip_metadata: bool = False, out_dir: Path = Path("output"),
+                pacing_mode: str = "conservative", cookies_browser: Optional[str] = None,
+                cookies_file: Optional[str] = None, proxy: Optional[str] = None,
+                config: Optional[AppConfig] = None) -> None:
     try:
         CANCEL_EVENT.clear()
         with LOCK:
@@ -294,6 +304,21 @@ def archive_job(urls_input: str, limit: int = 0, skip_comments: bool = False, sk
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         log(f"Output dir: {out_dir.resolve()}")
+
+        cfg = config or AppConfig(
+            out_dir=out_dir,
+            pacing_mode=pacing_mode or "conservative",
+            cookies_browser=cookies_browser or None,
+            cookies_file=cookies_file or None,
+            proxy=proxy or None
+        )
+        log(f"Rate limiting profile: {cfg.pacing_mode} (meta: {cfg.get_pacing_range('metadata')}, trans: {cfg.get_pacing_range('transcripts')}, comments: {cfg.get_pacing_range('comments')})")
+        if cfg.cookies_browser:
+            log(f"Using browser cookies from: {cfg.cookies_browser}")
+        if cfg.cookies_file:
+            log(f"Using cookies file: {cfg.cookies_file}")
+        if cfg.proxy:
+            log(f"Using proxy: {cfg.proxy}")
 
         miss = _missing()
         if miss:
@@ -320,7 +345,7 @@ def archive_job(urls_input: str, limit: int = 0, skip_comments: bool = False, sk
         log(f"Processing {len(url_list)} URL(s)")
         def cb(m): log(m)
 
-        videos, playlists, mappings = discover_videos(url_list, limit, cb)
+        videos, playlists, mappings = discover_videos(url_list, limit, cb, config=cfg)
         log(f"Unique: {len(videos)} videos, {len(playlists)} playlists, {len(mappings)} mappings")
         if not videos:
             log("No videos found")
@@ -329,19 +354,19 @@ def archive_job(urls_input: str, limit: int = 0, skip_comments: bool = False, sk
 
         persist_discovery(videos, playlists, mappings, out_dir)
 
-        fetch_all_metadata(videos, out_dir, skip_metadata, cb)
+        fetch_all_metadata(videos, out_dir, skip_metadata, cb, config=cfg)
         if is_cancelled():
             log("Cancelled after metadata")
             set_stage("idle")
             return
 
-        fetch_all_transcripts(videos, out_dir, skip_transcripts, cb)
+        fetch_all_transcripts(videos, out_dir, skip_transcripts, cb, config=cfg)
         if is_cancelled():
             log("Cancelled after transcripts")
             set_stage("idle")
             return
 
-        fetch_all_comments(videos, out_dir, skip_comments, cb)
+        fetch_all_comments(videos, out_dir, skip_comments, cb, config=cfg)
         if is_cancelled():
             log("Cancelled after comments")
             set_stage("idle")
@@ -486,6 +511,48 @@ https://www.youtube.com/@Channel/videos"></textarea>
 <button id="cancel" class="btn red hidden">⏹ Cancel</button>
 </div>
 <div id="inlineUrlError" class="small" style="color:var(--err);margin-top:6px"></div>
+
+<div class="collapsible open" id="antiBlockPanel" style="margin-top:12px">
+<div class="collapsible-header" onclick="this.parentElement.classList.toggle('open')">
+  <span>🛡️ <strong>Anti-Blocking & Rate Limit Protections</strong> <span class="small" style="color:var(--accent2);margin-left:6px">(Configured to prevent YouTube lockouts)</span></span>
+  <span class="small">▼</span>
+</div>
+<div class="collapsible-body">
+  <div class="row" style="flex-wrap:wrap;gap:12px">
+    <div style="flex:1;min-width:180px">
+      <label>PACING PRESET</label>
+      <select id="pacing_mode" style="width:100%">
+        <option value="conservative" selected>Conservative (2-4s + backoff, recommended)</option>
+        <option value="normal">Normal (1-3s pacing)</option>
+        <option value="fast">Fast (Short batches &lt;10 only)</option>
+      </select>
+    </div>
+    <div style="flex:1;min-width:160px">
+      <label>BROWSER COOKIES</label>
+      <select id="cookies_browser" style="width:100%">
+        <option value="" selected>None (Anonymous)</option>
+        <option value="chrome">Chrome</option>
+        <option value="edge">Edge</option>
+        <option value="firefox">Firefox</option>
+        <option value="brave">Brave</option>
+      </select>
+    </div>
+    <div style="flex:1;min-width:200px">
+      <label>PROXY URL (OPTIONAL)</label>
+      <input id="proxy" type="text" placeholder="http://user:pass@host:port" style="width:100%"/>
+    </div>
+    <div style="flex:1;min-width:200px">
+      <label>COOKIES FILE (OPTIONAL)</label>
+      <input id="cookies_file" type="text" placeholder="./cookies.txt" style="width:100%"/>
+    </div>
+  </div>
+  <div class="small" style="color:var(--text-muted);margin-top:8px">
+    • <b>Adaptive Throttler:</b> Adds random jitter, auto-retries on 429/RequestBlocked with exponential backoff, rests every 25 items, and activates circuit breaker cooloff.<br/>
+    • <b>Dual-Path Transcripts:</b> Seamlessly falls back to yt-dlp caption extraction when YouTube blocks direct timedtext requests.<br/>
+    • <b>Browser Cookies:</b> If YouTube serves "Sign in to confirm you're not a bot", select your browser to borrow your active YouTube session.
+  </div>
+</div>
+</div>
 </div>
 
 <div class="card" id="progressCard">
@@ -665,6 +732,10 @@ function loadSettings(){
     if(s.f_sort) document.getElementById("f_sort").value = s.f_sort;
     if(s.f_minq) document.getElementById("f_minq").value = s.f_minq;
     if(s.q) document.getElementById("q").value = s.q;
+    if(s.pacing_mode && document.getElementById("pacing_mode")) document.getElementById("pacing_mode").value = s.pacing_mode;
+    if(s.cookies_browser && document.getElementById("cookies_browser")) document.getElementById("cookies_browser").value = s.cookies_browser;
+    if(s.proxy && document.getElementById("proxy")) document.getElementById("proxy").value = s.proxy;
+    if(s.cookies_file && document.getElementById("cookies_file")) document.getElementById("cookies_file").value = s.cookies_file;
   }catch(e){}
 }
 function saveSettings(){
@@ -682,11 +753,15 @@ function saveSettings(){
     f_has_summary: document.getElementById("f_has_summary").value,
     f_sort: document.getElementById("f_sort").value,
     f_minq: document.getElementById("f_minq").value,
-    q: document.getElementById("q").value
+    q: document.getElementById("q").value,
+    pacing_mode: document.getElementById("pacing_mode") ? document.getElementById("pacing_mode").value : "conservative",
+    cookies_browser: document.getElementById("cookies_browser") ? document.getElementById("cookies_browser").value : "",
+    proxy: document.getElementById("proxy") ? document.getElementById("proxy").value : "",
+    cookies_file: document.getElementById("cookies_file") ? document.getElementById("cookies_file").value : ""
   };
   localStorage.setItem("ytkb_settings", JSON.stringify(s));
 }
-["outdir","llm_provider","llm_endpoint","llm_model","llm_temp","llm_max","llm_prompt","s_type","limit","f_status","f_has_summary","f_sort","f_minq","q"].forEach(id=>{
+["outdir","llm_provider","llm_endpoint","llm_model","llm_temp","llm_max","llm_prompt","s_type","limit","f_status","f_has_summary","f_sort","f_minq","q","pacing_mode","cookies_browser","proxy","cookies_file"].forEach(id=>{
   const el = document.getElementById(id);
   if(el) el.addEventListener("change", saveSettings);
   if(el) el.addEventListener("input", ()=>{clearTimeout(window._saveT); window._saveT=setTimeout(saveSettings,400)});
@@ -798,12 +873,32 @@ document.getElementById("go").onclick=async()=>{
   const url=document.getElementById("url").value.trim();
   const limit=parseInt(document.getElementById("limit").value||"0");
   const outdir=document.getElementById("outdir").value||"output";
+  const pacing_mode=document.getElementById("pacing_mode") ? document.getElementById("pacing_mode").value : "conservative";
+  const cookies_browser=document.getElementById("cookies_browser") ? document.getElementById("cookies_browser").value : "";
+  const proxy=document.getElementById("proxy") ? document.getElementById("proxy").value : "";
+  const cookies_file=document.getElementById("cookies_file") ? document.getElementById("cookies_file").value : "";
+
   if(!url){ showToast("Paste YouTube URLs first", "error"); return; }
   validateUrlsInput();
   const lines = url.split(/[\n,]+/).map(s=>s.trim()).filter(Boolean);
   if(lines.length===0){ showToast("No valid URLs", "error"); return; }
-  await fetch("/api/archive",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({urls:url, limit, out_dir:outdir, skip_metadata:document.getElementById("skipMeta").checked, skip_transcripts:document.getElementById("skipT").checked, skip_comments:document.getElementById("skipC").checked})});
-  showToast(`Started archiving ${lines.length} URL(s)`, "success");
+  await fetch("/api/archive",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      urls:url,
+      limit,
+      out_dir:outdir,
+      skip_metadata:document.getElementById("skipMeta").checked,
+      skip_transcripts:document.getElementById("skipT").checked,
+      skip_comments:document.getElementById("skipC").checked,
+      pacing_mode,
+      cookies_browser,
+      cookies_file,
+      proxy
+    })
+  });
+  showToast(`Started archiving ${lines.length} URL(s) [pacing: ${pacing_mode}]`, "success");
   poll();
 };
 
@@ -1481,13 +1576,7 @@ class Handler(BaseHTTPRequestHandler):
                             snippet_src = row.get("summary") or row.get("text") or row.get("description") or ""
 
                     snippet = snippet_src[:600]
-                    highlighted = snippet
-                    try:
-                        for term in terms:
-                            # escape HTML first? simple
-                            highlighted = re.sub(f"({re.escape(term)})", r"<mark>\1</mark>", highlighted, flags=re.IGNORECASE)
-                    except re.error:
-                        pass
+                    highlighted = highlight_search_snippet(snippet, query)
                     return {"field": field, "reasons": reasons, "highlighted": highlighted, "raw": snippet[:400]}
 
                 enriched = []
@@ -1525,7 +1614,26 @@ class Handler(BaseHTTPRequestHandler):
             skip_comments = bool(data.get("skip_comments", False))
             skip_transcripts = bool(data.get("skip_transcripts", False))
             skip_metadata = bool(data.get("skip_metadata", False))
-            t = threading.Thread(target=archive_job, args=(urls, limit, skip_comments, skip_transcripts, skip_metadata, out_dir), daemon=True)
+            pacing_mode = data.get("pacing_mode", "conservative")
+            cookies_browser = data.get("cookies_browser") or None
+            cookies_file = data.get("cookies_file") or None
+            proxy = data.get("proxy") or None
+            t = threading.Thread(
+                target=archive_job,
+                kwargs={
+                    "urls_input": urls,
+                    "limit": limit,
+                    "skip_comments": skip_comments,
+                    "skip_transcripts": skip_transcripts,
+                    "skip_metadata": skip_metadata,
+                    "out_dir": out_dir,
+                    "pacing_mode": pacing_mode,
+                    "cookies_browser": cookies_browser,
+                    "cookies_file": cookies_file,
+                    "proxy": proxy,
+                },
+                daemon=True
+            )
             t.start()
             self._set_headers()
             self.wfile.write(json.dumps({"ok": True, "started": True}).encode("utf-8"))
@@ -1544,12 +1652,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": "video_id required"}).encode("utf-8"))
                 return
             out_dir = self._get_out_dir()
+            cfg = AppConfig(
+                out_dir=out_dir,
+                pacing_mode=data.get("pacing_mode", CONFIG.pacing_mode),
+                cookies_browser=data.get("cookies_browser", CONFIG.cookies_browser),
+                cookies_file=data.get("cookies_file", CONFIG.cookies_file),
+                proxy=data.get("proxy", CONFIG.proxy)
+            )
             try:
                 # remove old entry to force retry
                 if rtype == "metadata":
                     remove_id_from_jsonl(out_dir / "videos_full.jsonl", "id", video_id)
                     remove_id_from_jsonl(out_dir / "failed_metadata.jsonl", "video_id", video_id)
-                    fetch_videos_full_metadata([video_id], out_path=out_dir / "videos_full.jsonl", progress_cb=lambda m: log(m), resume=True, cancel_check=is_cancelled)
+                    fetch_videos_full_metadata([video_id], out_path=out_dir / "videos_full.jsonl", progress_cb=lambda m: log(m), resume=True, cancel_check=is_cancelled, config=cfg)
                 elif rtype == "transcript":
                     remove_id_from_jsonl(out_dir / "transcripts.jsonl", "video_id", video_id)
                     remove_id_from_jsonl(out_dir / "failed_transcripts.jsonl", "video_id", video_id)
@@ -1568,7 +1683,7 @@ class Handler(BaseHTTPRequestHandler):
                                     vinfo.update(dict(row))
                     except Exception:
                         pass
-                    fetch_transcripts_bulk([vinfo], out_path=out_dir / "transcripts.jsonl", resume=True, progress_cb=lambda m: log(m), cancel_check=is_cancelled)
+                    fetch_transcripts_bulk([vinfo], out_path=out_dir / "transcripts.jsonl", resume=True, progress_cb=lambda m: log(m), cancel_check=is_cancelled, config=cfg)
                 elif rtype == "comments":
                     # comments file is append per comment, need to remove all for video
                     # reuse helper but key is video_id for comments (multiple lines)
@@ -1588,7 +1703,7 @@ class Handler(BaseHTTPRequestHandler):
                         except OSError:
                             pass
                     remove_id_from_jsonl(out_dir / "failed_comments.jsonl", "video_id", video_id)
-                    fetch_comments_bulk([video_id], out_path=out_dir / "comments.jsonl", resume=True, progress_cb=lambda m: log(m), cancel_check=is_cancelled)
+                    fetch_comments_bulk([video_id], out_path=out_dir / "comments.jsonl", resume=True, progress_cb=lambda m: log(m), cancel_check=is_cancelled, config=cfg)
                 else:
                     raise ValueError(f"Unknown retry type {rtype}")
 
@@ -1739,6 +1854,10 @@ def main_cli():
     parser.add_argument("--llm-provider", default=CONFIG.default_provider, help="ollama or lmstudio (env YTK_LLM_PROVIDER)")
     parser.add_argument("--llm-endpoint", default=None, help="LLM endpoint")
     parser.add_argument("--llm-model", default=CONFIG.default_model, help="LLM model (env YTK_LLM_MODEL)")
+    parser.add_argument("--pacing", choices=["conservative", "normal", "fast"], default=os.getenv("YTK_PACING_MODE", "conservative"), help="Pacing preset: conservative, normal, fast")
+    parser.add_argument("--cookies-browser", default=os.getenv("YTK_COOKIES_BROWSER", None), help="Browser name to extract cookies from (chrome, edge, firefox, brave)")
+    parser.add_argument("--cookies-file", default=os.getenv("YTK_COOKIES_FILE", None), help="Path to cookies.txt")
+    parser.add_argument("--proxy", default=os.getenv("YTK_PROXY", None), help="Proxy URL (http://user:pass@host:port)")
     args = parser.parse_args()
 
     host = os.getenv("YTK_HOST", args.host)
@@ -1787,7 +1906,18 @@ def main_cli():
         return
 
     out_dir = Path(args.out_dir)
-    archive_job(urls_input, limit=args.limit, skip_comments=args.skip_comments, skip_transcripts=args.skip_transcripts, skip_metadata=args.skip_metadata, out_dir=out_dir)
+    archive_job(
+        urls_input,
+        limit=args.limit,
+        skip_comments=args.skip_comments,
+        skip_transcripts=args.skip_transcripts,
+        skip_metadata=args.skip_metadata,
+        out_dir=out_dir,
+        pacing_mode=args.pacing,
+        cookies_browser=args.cookies_browser,
+        cookies_file=args.cookies_file,
+        proxy=args.proxy
+    )
 
 if __name__ == "__main__":
     main_cli()
