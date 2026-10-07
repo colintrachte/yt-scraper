@@ -44,6 +44,7 @@ from core import (
     test_llm_connection,
     update_video_summary,
     update_video_user_score,
+    read_existing_ids_jsonl,
 )
 from core import get_playlist_data as core_get_playlist_data
 from search import search_videos as search_search_videos  # type: ignore[attr-defined]
@@ -718,6 +719,54 @@ def archive_job(urls: list[str], opts: dict) -> None:
         with LOCK:
             STATE["total"] = len(video_ids)
         _log(f"Discovered {len(video_ids)} unique videos")
+
+        # [NEW] Resume detection - zero wasted API calls
+        try:
+            existing_meta = (
+                read_existing_ids_jsonl(out_dir / "videos_full.jsonl", key="id")
+                if (out_dir / "videos_full.jsonl").exists()
+                else set()
+            )
+            existing_trans = (
+                read_existing_ids_jsonl(out_dir / "transcripts.jsonl", key="video_id")
+                if (out_dir / "transcripts.jsonl").exists()
+                else set()
+            )
+            existing_comm = set()
+            comm_path = out_dir / "comments.jsonl"
+            if comm_path.exists():
+                try:
+                    with open(comm_path, encoding="utf-8", errors="ignore") as rf:
+                        for line in rf:
+                            try:
+                                j = json.loads(line)
+                                if j.get("video_id"):
+                                    existing_comm.add(j["video_id"])
+                            except json.JSONDecodeError:
+                                continue
+                except OSError:
+                    pass
+            if existing_meta or existing_trans or existing_comm:
+                new_vids = [v for v in video_ids if v not in existing_meta]
+                trans_remaining = [v for v in video_ids if v not in existing_trans]
+                comm_remaining = [v for v in video_ids if v not in existing_comm]
+                _log(
+                    f"RESUME detected in {out_dir}: "
+                    f"{len(existing_meta)} metadata already, "
+                    f"{len(existing_trans)} transcripts already, "
+                    f"{len(existing_comm)} comment sets already. "
+                    f"{len(new_vids)} new videos need metadata, "
+                    f"{len(trans_remaining)} need transcripts, "
+                    f"{len(comm_remaining)} need comments. No API calls will be wasted."
+                )
+                with LOCK:
+                    STATE["stage_details"] = (
+                        f"Resume: {len(existing_meta)}/{len(video_ids)} meta done, "
+                        f"{len(existing_trans)}/{len(video_ids)} transcripts done, "
+                        f"{len(existing_comm)}/{len(video_ids)} comments done"
+                    )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Resume detection failed: {e}")
 
         if cancel_check():
             raise RuntimeError("Cancelled after discovery")
