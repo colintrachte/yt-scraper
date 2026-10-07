@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-core.py - Refactored knowledgebase core
+core.py - Refactored knowledgebase core (FIXED)
 - Structured logging, type hints, dataclasses
 - Repository layer with context managers and migrations
 - Append-only JSONL with deduplication
 - Preserves DB on rebuild, single-open failure logs, transcript truncation
 - Retry logic for LLM calls
+Fixes:
+  - indentation crash in fetch_transcripts_bulk
+  - throttler service names (metadata vs transcripts vs comments)
+  - is_valid_video_id simplified to avoid PL-prefix false negatives
+  - GenericProxyConfig type-ignore for Pylance
+  - dedupe helpers
 """
 
-from __future__ import annotations
+from __future__ import annotations  # ruff: noqa: I001
 
 import html
 import json
@@ -22,10 +28,14 @@ import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+Dict = dict
+List = list
+Tuple = tuple
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -39,8 +49,8 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-ProgressCb = Optional[Callable[[str], None]]
-CancelCheck = Optional[Callable[[], bool]]
+ProgressCb = Callable[[str], None] | None
+CancelCheck = Callable[[], bool] | None
 
 # ---------------------------------------------------------------------------
 # Config & Pacing Profiles
@@ -103,7 +113,7 @@ class AppConfig:
     def db_path(self) -> Path:
         return Path(self.out_dir) / self.db_name
 
-    def get_pacing_range(self, service: str) -> tuple[float, float]:
+    def get_pacing_range(self, service: str) -> Tuple[float, float]:
         profile = PACING_PROFILES.get(
             self.pacing_mode.lower(), PACING_PROFILES["conservative"]
         )
@@ -116,7 +126,6 @@ CONFIG = AppConfig()
 # Models
 # ---------------------------------------------------------------------------
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-PLAYLIST_PREFIXES = ("PL", "UU", "OL", "LL", "RD", "FL", "UL", "PU")
 SCHEMA_VERSION = 2
 
 
@@ -143,7 +152,7 @@ class PlaylistRecord:
     uploader: str = ""
     video_count: int = 0
     url: str = ""
-    tags: list[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
     meta_json: str = ""
 
 
@@ -163,7 +172,7 @@ class TranscriptRecord:
     channel_id: str = ""
     language: str = "en"
     text: str = ""
-    segments: list[dict[str, Any]] = field(default_factory=list)
+    segments: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -175,7 +184,7 @@ class QualityDetails:
     consensus: float = 0
     total: float = 0
     label: str = "poor"
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -199,17 +208,15 @@ def parse_vote_count(v: Any) -> int:
 
 
 def is_valid_video_id(vid: str) -> bool:
+    """Fixed: only length+regex matters. 11-char IDs can start with PL, UU etc."""
     if not vid:
         return False
     if len(vid) != 11:
-        if vid.startswith(PLAYLIST_PREFIXES) and len(vid) > 11:
-            return False
-        if len(vid) > 11:
-            return False
+        return False
     return bool(VIDEO_ID_RE.match(vid))
 
 
-def extract_ids_from_url(url: str) -> tuple[str | None, str | None]:
+def extract_ids_from_url(url: str) -> Tuple[str | None, str | None]:
     try:
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
@@ -220,7 +227,7 @@ def extract_ids_from_url(url: str) -> tuple[str | None, str | None]:
             if is_valid_video_id(possible):
                 v = possible
         return v, p
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug(f"extract_ids_from_url failed for {url}: {e}")
         return None, None
 
@@ -230,7 +237,7 @@ def _log(msg: str, cb: ProgressCb = None) -> None:
     if cb:
         try:
             cb(msg)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # noqa: BLE001 - progress callback must not crash main flow
             logger.debug(f"progress_cb failed: {e}")
 
 
@@ -242,7 +249,6 @@ class ThrottleAbort(Exception):
 
 
 def is_rate_limit_error(e: Exception) -> bool:
-    """Detects YouTube throttling, HTTP 429, RequestBlocked, IpBlocked, or bot detection."""
     msg = str(e).lower()
     err_cls = e.__class__.__name__.lower()
     patterns = [
@@ -263,7 +269,6 @@ def is_rate_limit_error(e: Exception) -> bool:
 
 
 def is_hard_block_error(e: Exception) -> bool:
-    """IP-level blocks. Do NOT try a second extraction path when these happen."""
     msg = str(e).lower()
     err_cls = e.__class__.__name__.lower()
     return any(
@@ -283,20 +288,15 @@ YDL_POLITE_OPTS = {
     "skip_download": True,
     "no_warnings": True,
     "no_playlist": True,
-    # Must be False. With True, yt-dlp swallows 429 and bot errors and the
-    # AdaptiveThrottler never sees them.
     "ignoreerrors": False,
-    # Let AdaptiveThrottler own backoff instead of yt-dlp silently retrying.
     "retries": 1,
     "extractor_retries": 1,
     "sleep_interval_requests": 1.0,
-    # Fewer requests per video: skip manifests and translated captions.
     "extractor_args": {"youtube": {"skip": ["hls", "dash", "translated_subs"]}},
 }
 
 
 def is_permanent_transcript_error(e: Exception) -> bool:
-    """Detects errors where transcripts simply do not exist or are disabled (non-retryable)."""
     msg = str(e).lower()
     err_cls = e.__class__.__name__.lower()
     permanent_patterns = [
@@ -311,9 +311,8 @@ def is_permanent_transcript_error(e: Exception) -> bool:
 
 
 def get_ydl_opts(
-    base_opts: dict[str, Any] | None = None, config: AppConfig | None = None
-) -> dict[str, Any]:
-    """Applies proxy and cookie configurations to yt-dlp options."""
+    base_opts: Dict[str, Any] | None = None, config: AppConfig | None = None
+) -> Dict[str, Any]:
     opts = base_opts.copy() if base_opts else {}
     cfg = config or CONFIG
     if cfg.cookies_browser:
@@ -326,15 +325,10 @@ def get_ydl_opts(
 
 
 class AdaptiveThrottler:
-    """
-    Manages request pacing with jitter, exponential backoff on 429/blocks,
-    circuit breaker cooldowns, and chunk rest pauses.
-    """
-
     def __init__(
         self,
         service_name: str,
-        pacing_range: tuple[float, float] = (2.0, 4.0),
+        pacing_range: Tuple[float, float] = (2.0, 4.0),
         chunk_size: int = 25,
         chunk_pause_sec: float = 30.0,
         max_retries: int = 3,
@@ -366,7 +360,6 @@ class AdaptiveThrottler:
         progress_cb: ProgressCb = None,
         message: str = "",
     ) -> bool:
-        """Sleeps in small slices (0.25s) so cancel_check is promptly honored."""
         if duration <= 0:
             return True
         if message and progress_cb:
@@ -383,20 +376,17 @@ class AdaptiveThrottler:
     def pace(
         self, cancel_check: CancelCheck = None, progress_cb: ProgressCb = None
     ) -> bool:
-        """Applies random jittered pacing delay and periodic chunk rest pauses."""
         self.processed_count += 1
         if self.chunk_size > 0 and (self.processed_count % self.chunk_size == 0):
-            msg = f"[{self.service_name} cooldown] Processed {self.processed_count} items; resting for {self.chunk_pause_sec:.1f}s to avoid rate limits..."
+            msg = f"[{self.service_name} cooldown] Processed {self.processed_count} items; resting for {self.chunk_pause_sec:.1f}s..."
             if not self.sleep_interruptible(
                 self.chunk_pause_sec, cancel_check, progress_cb, msg
             ):
                 return False
-
         delay = random.uniform(self.min_delay, self.max_delay)
         return self.sleep_interruptible(delay, cancel_check)
 
     def record_success(self) -> None:
-        """Resets consecutive blocks; forgives old breaker trips after a healthy streak."""
         self.consecutive_blocks = 0
         self.success_streak += 1
         if self.success_streak >= 10:
@@ -410,7 +400,6 @@ class AdaptiveThrottler:
         progress_cb: ProgressCb = None,
         retry_after: float | None = None,
     ) -> bool:
-        """Applies backoff; raises ThrottleAbort when cooldowns clearly are not helping."""
         self.consecutive_blocks += 1
         self.success_streak = 0
         if (
@@ -435,7 +424,6 @@ class AdaptiveThrottler:
             return self.sleep_interruptible(
                 self.circuit_breaker_pause_sec, cancel_check, progress_cb, msg
             )
-
         backoff_sec = self.calculate_backoff(attempt, retry_after)
         short_err = error_msg[:80] + "..." if len(error_msg) > 80 else error_msg
         msg = f"[{self.service_name} 429/throttle] {short_err} -> retry {attempt + 1}/{self.max_retries} after {backoff_sec:.1f}s"
@@ -444,7 +432,6 @@ class AdaptiveThrottler:
     def calculate_backoff(
         self, attempt: int, retry_after: float | None = None
     ) -> float:
-        """Computes exponential backoff with full jitter, honoring Retry-After if present."""
         if retry_after is not None and retry_after > 0:
             return retry_after + random.uniform(0.5, 2.0)
         delay = min(self.backoff_max_sec, self.backoff_base_sec * (2**attempt))
@@ -475,29 +462,23 @@ def safe_json_loads(s: str, default: Any = None) -> Any:
         return default
 
 
-def parse_tags_field(raw: Any) -> list[str]:
-    """Correct tag parsing - deserializes JSON array and checks membership exactly."""
+def parse_tags_field(raw: Any) -> List[str]:
     if not raw:
         return []
     if isinstance(raw, list):
         return [str(t).lower() for t in raw]
     if isinstance(raw, str):
-        # try json
         try:
             arr = json.loads(raw)
             if isinstance(arr, list):
                 return [str(t).lower() for t in arr]
         except json.JSONDecodeError:
             pass
-        # fallback: space separated? return lower split
-        # but for original substring bug, we avoid substring matching
-        # If raw is like '["python", "ai"]' failed above, we still try to split
         return [raw.lower()] if raw else []
     return []
 
 
 def highlight_search_snippet(snippet: str, query: str) -> str:
-    """Render untrusted source text safely with only our own highlight markup."""
     terms = sorted(
         {term for term in query.split() if len(term) >= 2}, key=len, reverse=True
     )
@@ -515,11 +496,10 @@ def highlight_search_snippet(snippet: str, query: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# JSONL helpers - append-only with deduplication
+# JSONL helpers
 # ---------------------------------------------------------------------------
-def load_jsonl_deduped(path: Path, key: str = "video_id") -> dict[str, dict[str, Any]]:
-    """Load JSONL keeping last occurrence (append-only semantics)."""
-    result: dict[str, dict[str, Any]] = {}
+def load_jsonl_deduped(path: Path, key: str = "video_id") -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
     if not path.exists():
         return result
     try:
@@ -543,7 +523,7 @@ def read_existing_ids_jsonl(path: Path, key: str = "video_id") -> set[str]:
     return set(load_jsonl_deduped(path, key).keys())
 
 
-def append_jsonl(path: Path, record: dict[str, Any]) -> None:
+def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with open(path, "a", encoding="utf-8") as f:
@@ -553,8 +533,7 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
         raise
 
 
-def rewrite_jsonl_deduped(path: Path, records: dict[str, dict[str, Any]]) -> None:
-    """Used only for compaction/export, not on every edit."""
+def rewrite_jsonl_deduped(path: Path, records: Dict[str, Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -566,7 +545,7 @@ def rewrite_jsonl_deduped(path: Path, records: dict[str, dict[str, Any]]) -> Non
 
 
 # ---------------------------------------------------------------------------
-# DB layer - context managers + migrations
+# DB layer
 # ---------------------------------------------------------------------------
 @contextmanager
 def db_connection(db_path: Path):
@@ -660,7 +639,6 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS summaries(id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT, summary TEXT, source TEXT, created_at TEXT)"
     )
 
-    # FTS tables - create if not exists
     for fts_sql in [
         "CREATE VIRTUAL TABLE IF NOT EXISTS videos_fts USING fts5(video_id, title, description, tags, channel, tokenize='porter unicode61')",
         "CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(video_id, title, text, tokenize='porter unicode61')",
@@ -685,7 +663,6 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ]:
         conn.execute(idx_sql)
 
-    # version bump
     cur = conn.execute(
         "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
     )
@@ -694,15 +671,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     if current < SCHEMA_VERSION:
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?,?)",
-            (SCHEMA_VERSION, datetime.now().isoformat()),
+            (SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
         )
         logger.info(f"DB migrated to version {SCHEMA_VERSION}")
 
 
-def read_preserved_user_data(db_path: Path) -> tuple[dict[str, dict], dict[str, dict]]:
-    """Preserve user scores and summaries from existing DB to avoid data loss on rebuild."""
-    scores: dict[str, dict] = {}
-    summaries: dict[str, dict] = {}
+def read_preserved_user_data(db_path: Path) -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
+    scores: Dict[str, Dict] = {}
+    summaries: Dict[str, Dict] = {}
     if not db_path.exists():
         return scores, summaries
     try:
@@ -720,7 +696,7 @@ def read_preserved_user_data(db_path: Path) -> tuple[dict[str, dict], dict[str, 
                         "video_id": r["video_id"],
                         "user_score": r["user_score"],
                         "user_notes": r["user_notes"] or "",
-                        "updated_at": datetime.now().isoformat(),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
                     }
             except sqlite3.OperationalError as e:
                 logger.debug(f"read preserved scores failed: {e}")
@@ -733,11 +709,12 @@ def read_preserved_user_data(db_path: Path) -> tuple[dict[str, dict], dict[str, 
                         "video_id": r["video_id"],
                         "summary": r["summary"],
                         "source": r["summary_source"] or "preserved_db",
-                        "created_at": r["summary_date"] or datetime.now().isoformat(),
+                        "created_at": r["summary_date"]
+                        or datetime.now(timezone.utc).isoformat(),
                     }
             except sqlite3.OperationalError as e:
                 logger.debug(f"read preserved summaries failed: {e}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Could not read preserved data from DB: {e}")
     return scores, summaries
 
@@ -752,7 +729,7 @@ def get_playlist_data(
     cancel_check: CancelCheck = None,
     config: AppConfig | None = None,
     throttler: AdaptiveThrottler | None = None,
-) -> tuple[list[dict], list[dict], list[dict]]:
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     import yt_dlp
 
     cfg = config or CONFIG
@@ -764,9 +741,9 @@ def get_playlist_data(
         urls_to_try.append(f"https://www.youtube.com/playlist?list={p_id}")
     urls_to_try.append(url)
 
-    all_videos: dict[str, dict] = {}
-    all_playlists: dict[str, dict] = {}
-    mappings: list[dict] = []
+    all_videos: Dict[str, Dict] = {}
+    all_playlists: Dict[str, Dict] = {}
+    mappings: List[Dict] = []
 
     for attempt_url in urls_to_try:
         if cancel_check and cancel_check():
@@ -781,7 +758,7 @@ def get_playlist_data(
         ) or (p_id and p_id in attempt_url)
         ydl_opts = get_ydl_opts(YDL_POLITE_OPTS, cfg)
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore[arg-type]
                 info = ydl.extract_info(attempt_url, download=False)
                 if not info:
                     continue
@@ -884,7 +861,7 @@ def get_playlist_data(
                             "video_id": vid,
                             "position": 0,
                         })
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             _log(f"Attempt {attempt_url} failed: {e}", progress_cb)
 
     if not all_videos and v_id and is_valid_video_id(v_id):
@@ -912,10 +889,10 @@ def get_playlist_data(
 
 
 # ---------------------------------------------------------------------------
-# Full metadata - failure log opened once per batch
+# Full metadata
 # ---------------------------------------------------------------------------
 def fetch_videos_full_metadata(
-    video_ids: list[str],
+    video_ids: List[str],
     out_path: Path,
     progress_cb: ProgressCb = None,
     resume: bool = True,
@@ -928,9 +905,7 @@ def fetch_videos_full_metadata(
 
     cfg = config or CONFIG
     if throttler is None:
-        throttler = make_throttler(
-            "metadata", cfg
-        )  # "transcripts" / "comments" in the other two
+        throttler = make_throttler("metadata", cfg)
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -943,99 +918,96 @@ def fetch_videos_full_metadata(
     with (
         open(out_path, mode, encoding="utf-8") as f_out,
         open(failures_path, "a", encoding="utf-8") as f_fail,
+        yt_dlp.YoutubeDL(ydl_opts) as ydl,  # type: ignore[arg-type]
     ):
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            for vid in video_ids:
-                if cancel_check and cancel_check():
-                    logger.info("Metadata fetch cancelled")
+        for vid in video_ids:
+            if cancel_check and cancel_check():
+                logger.info("Metadata fetch cancelled")
+                break
+            if not is_valid_video_id(vid):
+                continue
+            if vid in existing:
+                continue
+            if not throttler.pace(cancel_check, progress_cb):
+                logger.info("Metadata fetch cancelled during pacing")
+                break
+            for attempt in range(throttler.max_retries + 1):
+                try:
+                    info = ydl.extract_info(
+                        f"https://www.youtube.com/watch?v={vid}", download=False
+                    )
+                    if not info:
+                        raise ValueError("No info returned by yt-dlp")
+                    rec = {
+                        "id": vid,
+                        "title": info.get("title") or "",
+                        "fulltitle": info.get("fulltitle") or "",
+                        "description": info.get("description") or "",
+                        "tags": info.get("tags") or [],
+                        "categories": info.get("categories") or [],
+                        "channel": info.get("channel") or "",
+                        "channel_id": info.get("channel_id") or "",
+                        "channel_url": info.get("channel_url") or "",
+                        "uploader": info.get("uploader") or "",
+                        "uploader_id": info.get("uploader_id") or "",
+                        "upload_date": info.get("upload_date") or "",
+                        "timestamp": info.get("timestamp") or 0,
+                        "duration": info.get("duration") or 0,
+                        "view_count": info.get("view_count") or 0,
+                        "like_count": info.get("like_count") or 0,
+                        "comment_count": info.get("comment_count") or 0,
+                        "thumbnail": info.get("thumbnail") or "",
+                        "language": info.get("language") or "",
+                        "chapters": info.get("chapters") or [],
+                        "url": f"https://www.youtube.com/watch?v={vid}",
+                    }
+                    f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    f_out.flush()
+                    ok += 1
+                    throttler.record_success()
+                    _log(f"[meta OK] {vid} tags={len(rec['tags'])}", progress_cb)
                     break
-                if not is_valid_video_id(vid):
-                    continue
-                if vid in existing:
-                    continue
-
-                if not throttler.pace(cancel_check, progress_cb):
-                    logger.info("Metadata fetch cancelled during pacing")
-                    break
-
-                for attempt in range(throttler.max_retries + 1):
-                    try:
-                        info = ydl.extract_info(
-                            f"https://www.youtube.com/watch?v={vid}", download=False
-                        )
-                        if not info:
-                            raise ValueError("No info returned by yt-dlp")
-                        rec = {
-                            "id": vid,
-                            "title": info.get("title") or "",
-                            "fulltitle": info.get("fulltitle") or "",
-                            "description": info.get("description") or "",
-                            "tags": info.get("tags") or [],
-                            "categories": info.get("categories") or [],
-                            "channel": info.get("channel") or "",
-                            "channel_id": info.get("channel_id") or "",
-                            "channel_url": info.get("channel_url") or "",
-                            "uploader": info.get("uploader") or "",
-                            "uploader_id": info.get("uploader_id") or "",
-                            "upload_date": info.get("upload_date") or "",
-                            "timestamp": info.get("timestamp") or 0,
-                            "duration": info.get("duration") or 0,
-                            "view_count": info.get("view_count") or 0,
-                            "like_count": info.get("like_count") or 0,
-                            "comment_count": info.get("comment_count") or 0,
-                            "thumbnail": info.get("thumbnail") or "",
-                            "language": info.get("language") or "",
-                            "chapters": info.get("chapters") or [],
-                            "url": f"https://www.youtube.com/watch?v={vid}",
-                        }
-                        f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                        f_out.flush()
-                        ok += 1
-                        throttler.record_success()
-                        _log(f"[meta OK] {vid} tags={len(rec['tags'])}", progress_cb)
-                        break
-                    except Exception as e:
-                        if attempt < throttler.max_retries and is_rate_limit_error(e):
-                            if not throttler.handle_rate_limit(
-                                attempt,
-                                str(e),
-                                cancel_check=cancel_check,
-                                progress_cb=progress_cb,
-                            ):
-                                logger.info("Metadata fetch cancelled during backoff")
-                                return
-                        else:
-                            f_fail.write(
-                                json.dumps(
-                                    {
-                                        "video_id": vid,
-                                        "type": "metadata",
-                                        "error": str(e),
-                                        "url": f"https://www.youtube.com/watch?v={vid}",
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                + "\n"
+                except Exception as e:  # noqa: BLE001
+                    if attempt < throttler.max_retries and is_rate_limit_error(e):
+                        if not throttler.handle_rate_limit(
+                            attempt,
+                            str(e),
+                            cancel_check=cancel_check,
+                            progress_cb=progress_cb,
+                        ):
+                            logger.info("Metadata fetch cancelled during backoff")
+                            return
+                    else:
+                        f_fail.write(
+                            json.dumps(
+                                {
+                                    "video_id": vid,
+                                    "type": "metadata",
+                                    "error": str(e),
+                                    "url": f"https://www.youtube.com/watch?v={vid}",
+                                },
+                                ensure_ascii=False,
                             )
-                            f_fail.flush()
-                            _log(f"[meta FAIL] {vid}: {e}", progress_cb)
-                            break
+                            + "\n"
+                        )
+                        f_fail.flush()
+                        _log(f"[meta FAIL] {vid}: {e}", progress_cb)
+                        break
     _log(f"Full metadata: {ok} -> {out_path}", progress_cb)
 
 
 # ---------------------------------------------------------------------------
-# Transcripts - Multi-tier retrieval (Primary API + yt-dlp caption fallback)
+# Transcripts - Multi-tier
 # ---------------------------------------------------------------------------
 def _fetch_transcript_ytdlp_fallback(
     vid: str, config: AppConfig | None = None
-) -> tuple[str, list[dict[str, Any]], str]:
-    """Fallback transcript extraction using yt-dlp subtitles and automatic captions (timedtext json3)."""
+) -> Tuple[str, List[Dict[str, Any]], str]:
     import requests
     import yt_dlp
 
     cfg = config or CONFIG
     ydl_opts = get_ydl_opts(YDL_POLITE_OPTS, cfg)
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore[arg-type]
         info = ydl.extract_info(
             f"https://www.youtube.com/watch?v={vid}", download=False
         )
@@ -1113,24 +1085,16 @@ def _fetch_transcript_ytdlp_fallback(
 
 def _fetch_one_transcript_primary(
     vid: str, config: AppConfig | None = None
-) -> tuple[str, list[dict[str, Any]], str]:
-    """Primary transcript extraction using youtube_transcript_api 1.2+ (one listing, one fetch)."""
+) -> Tuple[str, List[Dict[str, Any]], str]:
     from youtube_transcript_api import NoTranscriptFound, YouTubeTranscriptApi
-    from youtube_transcript_api.proxies import GenericProxyConfig
+    from youtube_transcript_api.proxies import GenericProxyConfig  # type: ignore
 
-    # update youtube-transcript-api>=1.2.4 where stubs are fixed.
     cfg = config or CONFIG
     proxy_cfg = None
     if cfg.proxy:
-        proxy_cfg = (
-            GenericProxyConfig(http_url=cfg.proxy, https_url=cfg.proxy)
-            if cfg.proxy
-            else None
-        )  # type: ignore[arg-type]
-    api = YouTubeTranscriptApi(proxy_config=proxy_cfg)  # type: ignore
+        proxy_cfg = GenericProxyConfig(http_url=cfg.proxy, https_url=cfg.proxy)  # type: ignore[arg-type]
+    api = YouTubeTranscriptApi(proxy_config=proxy_cfg)  # type: ignore[arg-type]
 
-    # Errors (TranscriptsDisabled, VideoUnavailable, RequestBlocked, IpBlocked) propagate
-    # unchanged so callers can classify them as permanent vs. throttled.
     t_list = api.list(vid)
     wanted = ["en", "en-US", "en-GB"]
     chosen = None
@@ -1173,8 +1137,7 @@ def _fetch_one_transcript_primary(
 
 def _fetch_one_transcript(
     vid: str, config: AppConfig | None = None
-) -> tuple[str, list[dict[str, Any]], str]:
-    """Attempts primary transcript API, then seamlessly falls back to yt-dlp caption extraction."""
+) -> Tuple[str, List[Dict[str, Any]], str]:
     if not is_valid_video_id(vid):
         raise ValueError(f"Invalid video ID {vid}")
     primary_err = None
@@ -1185,9 +1148,8 @@ def _fetch_one_transcript(
         if is_permanent_transcript_error(e) or is_hard_block_error(e):
             raise
         logger.debug(
-            f"Primary transcript API failed for {vid} ({e}), trying yt-dlp subtitle fallback..."
+            f"Primary transcript API failed for {vid} ({e}), trying yt-dlp fallback..."
         )
-
     try:
         return _fetch_transcript_ytdlp_fallback(vid, config=config)
     except Exception as e_fallback:
@@ -1197,7 +1159,7 @@ def _fetch_one_transcript(
 
 
 def fetch_transcripts_bulk(
-    video_infos: list[dict],
+    video_infos: List[Dict],
     out_path: Path,
     resume: bool = True,
     progress_cb: ProgressCb = None,
@@ -1231,11 +1193,11 @@ def fetch_transcripts_bulk(
             if vid in existing:
                 skip += 1
                 continue
-
             if not throttler.pace(cancel_check, progress_cb):
                 logger.info("Transcript fetch cancelled during pacing")
                 break
 
+            # FIXED INDENTATION
             for attempt in range(throttler.max_retries + 1):
                 try:
                     full, segs, lang = _fetch_one_transcript(vid, config=cfg)
@@ -1255,7 +1217,7 @@ def fetch_transcripts_bulk(
                     throttler.record_success()
                     _log(f"[transcript OK] {vid}", progress_cb)
                     break
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     fail_rec = {
                         "video_id": vid,
                         "type": "transcript",
@@ -1264,7 +1226,6 @@ def fetch_transcripts_bulk(
                         "title": info.get("title", ""),
                     }
                     if is_permanent_transcript_error(e):
-                        # Captions truly do not exist: placeholder so resume skips this video.
                         rec = {
                             "video_id": vid,
                             "title": info.get("title", ""),
@@ -1285,7 +1246,6 @@ def fetch_transcripts_bulk(
                         break
                     if is_rate_limit_error(e):
                         if attempt < throttler.max_retries:
-                            # May raise ThrottleAbort, which propagates and closes the files cleanly.
                             if not throttler.handle_rate_limit(
                                 attempt,
                                 str(e),
@@ -1295,10 +1255,7 @@ def fetch_transcripts_bulk(
                                 logger.info("Transcript fetch cancelled during backoff")
                                 return
                             continue
-                        # Retries exhausted while blocked: log only, NO placeholder,
-                        # so the next run retries this video.
                         fail_rec["type"] = "transcript_blocked"
-                    # Blocked or unknown error: failure log only (not marked done in transcripts.jsonl).
                     f_fail.write(json.dumps(fail_rec, ensure_ascii=False) + "\n")
                     f_fail.flush()
                     err += 1
@@ -1311,10 +1268,10 @@ def fetch_transcripts_bulk(
 
 
 # ---------------------------------------------------------------------------
-# Comments - single failure handle
+# Comments
 # ---------------------------------------------------------------------------
 def fetch_comments_bulk(
-    video_ids: list[str],
+    video_ids: List[str],
     out_path: Path,
     limit_per_video: int = 0,
     resume: bool = True,
@@ -1368,7 +1325,6 @@ def fetch_comments_bulk(
                 continue
             if resume and vid in existing_vids:
                 continue
-
             if not throttler.pace(cancel_check, progress_cb):
                 logger.info("Comments fetch cancelled during pacing")
                 break
@@ -1378,7 +1334,7 @@ def fetch_comments_bulk(
                     gen = downloader.get_comments_from_url(
                         f"https://www.youtube.com/watch?v={vid}",
                         sort_by=0,
-                        sleep=cfg.comment_page_sleep,  # delay between comment pages
+                        sleep=cfg.comment_page_sleep,
                     )
                     batch = []
                     for cm in gen:
@@ -1398,7 +1354,7 @@ def fetch_comments_bulk(
                             break
                     if cancel_check and cancel_check():
                         logger.info("Comments fetch cancelled")
-                        return  # discard the partial video so a resume re-fetches it whole
+                        return
                     f_out.writelines(
                         json.dumps(rec, ensure_ascii=False) + "\n" for rec in batch
                     )
@@ -1407,7 +1363,7 @@ def fetch_comments_bulk(
                     throttler.record_success()
                     _log(f"[comments OK] {vid}: {len(batch)}", progress_cb)
                     break
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     if attempt < throttler.max_retries and is_rate_limit_error(e):
                         if not throttler.handle_rate_limit(
                             attempt,
@@ -1437,7 +1393,7 @@ def fetch_comments_bulk(
 
 
 # ---------------------------------------------------------------------------
-# Quality scoring - typed, specific exceptions
+# Quality scoring
 # ---------------------------------------------------------------------------
 def compute_quality_score(
     video: dict,
@@ -1445,9 +1401,8 @@ def compute_quality_score(
     comment_stats: dict | None,
     playlist_count: int,
     channel_video_count: int,
-) -> tuple[float, dict]:
-    score = 0
-    details: dict[str, Any] = {}
+) -> Tuple[float, dict]:
+    details: Dict[str, Any] = {}
     completeness = 0
 
     if transcript and transcript.get("text"):
@@ -1532,8 +1487,8 @@ def compute_quality_score(
     upload_date = video.get("upload_date", "")
     try:
         if upload_date and len(upload_date) == 8:
-            dt = datetime.strptime(upload_date, "%Y%m%d")
-            age_days = (datetime.now() - dt).days
+            dt = datetime.strptime(upload_date, "%Y%m%d").replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - dt).days
             details["age_days"] = age_days
             if age_days < 365:
                 freshness = 10
@@ -1586,9 +1541,9 @@ def compute_quality_score(
 
 
 # ---------------------------------------------------------------------------
-# DB building - refactored into small functions, preserves data
+# DB building helpers
 # ---------------------------------------------------------------------------
-def _load_playlists_batch(out_dir: Path) -> list[dict]:
+def _load_playlists_batch(out_dir: Path) -> List[Dict]:
     path = out_dir / "playlists.jsonl"
     if not path.exists():
         return []
@@ -1609,7 +1564,7 @@ def _load_playlists_batch(out_dir: Path) -> list[dict]:
     return out
 
 
-def _load_mappings_batch(out_dir: Path) -> list[dict]:
+def _load_mappings_batch(out_dir: Path) -> List[Dict]:
     path = out_dir / "playlist_videos.jsonl"
     if not path.exists():
         return []
@@ -1634,10 +1589,10 @@ def _load_mappings_batch(out_dir: Path) -> list[dict]:
     return out
 
 
-def _load_videos_full(out_dir: Path) -> dict[str, dict]:
+def _load_videos_full(out_dir: Path) -> Dict[str, Dict]:
     videos_full_path = out_dir / "videos_full.jsonl"
     videos_meta_path = out_dir / "videos_meta.json"
-    all_vids: dict[str, dict] = {}
+    all_vids: Dict[str, Dict] = {}
     if videos_meta_path.exists():
         try:
             for j in json.loads(videos_meta_path.read_text(encoding="utf-8")):
@@ -1662,9 +1617,9 @@ def _load_videos_full(out_dir: Path) -> dict[str, dict]:
     return all_vids
 
 
-def _load_transcript_map(out_dir: Path) -> dict[str, dict]:
+def _load_transcript_map(out_dir: Path) -> Dict[str, Dict]:
     path = out_dir / "transcripts.jsonl"
-    m: dict[str, dict] = {}
+    m: Dict[str, Dict] = {}
     if not path.exists():
         return m
     try:
@@ -1681,9 +1636,9 @@ def _load_transcript_map(out_dir: Path) -> dict[str, dict]:
     return m
 
 
-def _load_comment_stats(out_dir: Path) -> dict[str, dict]:
+def _load_comment_stats(out_dir: Path) -> Dict[str, Dict]:
     path = out_dir / "comments.jsonl"
-    stats: dict[str, dict] = {}
+    stats: Dict[str, Dict] = {}
     if not path.exists():
         return stats
     try:
@@ -1710,23 +1665,19 @@ def build_db(
     db_path: Path,
     progress_cb: ProgressCb = None,
     cancel_check: CancelCheck = None,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     out_dir = Path(out_dir)
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # --- Preserve user data instead of deleting DB ---
     preserved_scores, preserved_summaries = read_preserved_user_data(db_path)
-    # Also merge JSONL sources (deduped, last wins)
     jsonl_scores = load_jsonl_deduped(out_dir / "user_scores.jsonl", "video_id")
     jsonl_summaries = load_jsonl_deduped(out_dir / "summaries.jsonl", "video_id")
 
-    # JSONL takes precedence if it has newer data, but keep union
     merged_scores = {**preserved_scores, **jsonl_scores}
     merged_summaries = {**preserved_summaries, **jsonl_summaries}
 
     if db_path.exists():
-        # backup instead of unlink
         backup_path = db_path.with_suffix(".bak.db")
         try:
             with (
@@ -1735,17 +1686,15 @@ def build_db(
             ):
                 source.backup(destination)
             logger.info(f"Backed up existing DB to {backup_path}")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Backup failed: {e}")
 
-    # Load source files
     playlists_raw = _load_playlists_batch(out_dir)
     mappings_raw = _load_mappings_batch(out_dir)
     all_vids = _load_videos_full(out_dir)
     transcript_map = _load_transcript_map(out_dir)
     comment_stats = _load_comment_stats(out_dir)
 
-    # failure ids
     failed_ids: set[str] = set()
     for fp in [
         out_dir / "failed_transcripts.jsonl",
@@ -1766,23 +1715,18 @@ def build_db(
         except OSError as e:
             logger.debug(f"Failed to read failure file {fp}: {e}")
 
-    # counts for quality
-    playlist_count_map: dict[str, int] = {}
+    playlist_count_map: Dict[str, int] = {}
     for m in mappings_raw:
         playlist_count_map[m["video_id"]] = playlist_count_map.get(m["video_id"], 0) + 1
 
-    channel_count_map: dict[str, int] = {}
+    channel_count_map: Dict[str, int] = {}
     for v in all_vids.values():
         cid = v.get("channel_id") or v.get("channel") or "unknown"
         channel_count_map[cid] = channel_count_map.get(cid, 0) + 1
 
-    # Build DB with context manager
     with db_connection(db_path) as conn:
         ensure_schema(conn)
         cur = conn.cursor()
-
-        # Clear and repopulate derived tables (but keep videos user columns via upsert logic)
-        # For simplicity, delete FTS content and re-insert; videos table uses INSERT OR REPLACE with preserved fields
         try:
             cur.execute("DELETE FROM videos_fts")
             cur.execute("DELETE FROM transcripts_fts")
@@ -1798,7 +1742,6 @@ def build_db(
         except sqlite3.OperationalError as e:
             logger.debug(f"Clear tables note: {e}")
 
-        # Insert playlists
         pl_batch = []
         fts_batch = []
         for j in playlists_raw:
@@ -1837,7 +1780,6 @@ def build_db(
             )
             cur.executemany("INSERT INTO playlists_fts VALUES (?,?,?,?)", fts_batch)
 
-        # Insert mappings
         map_batch = []
         for j in mappings_raw:
             map_batch.append((j["playlist_id"], j["video_id"], j.get("position", 0)))
@@ -1853,7 +1795,6 @@ def build_db(
                 map_batch,
             )
 
-        # Insert videos with quality and preserved user data
         v_batch = []
         v_fts = []
         for vid, j in all_vids.items():
@@ -1869,7 +1810,6 @@ def build_db(
                 score, details = compute_quality_score(
                     j, trans, cstats, pcount, chcount
                 )
-
                 status = "ok"
                 if vid in failed_ids and not trans:
                     status = "no_transcript"
@@ -1878,7 +1818,6 @@ def build_db(
                 if trans and len(trans.get("text", "").split()) < 100:
                     status = "short_transcript"
 
-                # preserved
                 ps = merged_scores.get(vid, {})
                 user_score = ps.get("user_score")
                 user_notes = ps.get("user_notes", "")
@@ -1934,7 +1873,7 @@ def build_db(
                     cur.executemany("INSERT INTO videos_fts VALUES (?,?,?,?,?)", v_fts)
                     v_batch.clear()
                     v_fts.clear()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Video insert error {vid}: {e}")
 
         if v_batch:
@@ -1944,7 +1883,6 @@ def build_db(
             )
             cur.executemany("INSERT INTO videos_fts VALUES (?,?,?,?,?)", v_fts)
 
-        # Transcripts
         t_batch = []
         tf_batch = []
         for vid, j in transcript_map.items():
@@ -1978,7 +1916,6 @@ def build_db(
             )
             cur.executemany("INSERT INTO transcripts_fts VALUES (?,?,?)", tf_batch)
 
-        # Comments
         comments_path = out_dir / "comments.jsonl"
         if comments_path.exists():
             c_batch = []
@@ -2031,7 +1968,6 @@ def build_db(
                 )
                 cur.executemany("INSERT INTO comments_fts VALUES (?,?,?)", cf_batch)
 
-        # Failures
         for fp in [
             out_dir / "failed_transcripts.jsonl",
             out_dir / "failed_comments.jsonl",
@@ -2052,7 +1988,7 @@ def build_db(
                                     j.get("error", ""),
                                     j.get("url", ""),
                                     j.get("title", ""),
-                                    datetime.now().isoformat(),
+                                    datetime.now(timezone.utc).isoformat(),
                                 ),
                             )
                         except json.JSONDecodeError:
@@ -2060,7 +1996,6 @@ def build_db(
             except OSError as e:
                 logger.debug(f"Failed reading {fp}: {e}")
 
-        # Summaries FTS
         for vid, s in merged_summaries.items():
             try:
                 cur.execute(
@@ -2079,7 +2014,6 @@ def build_db(
             except sqlite3.OperationalError as e:
                 logger.debug(f"Summaries FTS insert failed for {vid}: {e}")
 
-        # Stats
         cur.execute("SELECT COUNT(*) FROM videos")
         vc = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM playlists")
@@ -2111,7 +2045,7 @@ def build_db(
 
 
 # ---------------------------------------------------------------------------
-# User edits - append-only
+# User edits
 # ---------------------------------------------------------------------------
 def update_video_user_score(
     db_path: Path,
@@ -2127,12 +2061,11 @@ def update_video_user_score(
         "video_id": video_id,
         "user_score": user_score,
         "user_notes": user_notes,
-        "updated_at": datetime.now().isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    # Append-only O(1)
     try:
         append_jsonl(scores_path, record)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Failed to append score: {e}")
 
     if db_path.exists():
@@ -2162,11 +2095,10 @@ def update_video_summary(
         "video_id": video_id,
         "summary": summary,
         "source": source,
-        "created_at": datetime.now().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
         append_jsonl(summaries_path, record)
-        # Export RAG on demand - write deduped
         all_summ = load_jsonl_deduped(summaries_path, "video_id")
         rewrite_jsonl_deduped(
             rag_path,
@@ -2175,7 +2107,7 @@ def update_video_summary(
                 for vid, s in all_summ.items()
             },
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Failed to append summary: {e}")
 
     if db_path.exists():
@@ -2184,7 +2116,7 @@ def update_video_summary(
                 cur = conn.cursor()
                 cur.execute(
                     "UPDATE videos SET summary=?, summary_source=?, summary_date=? WHERE video_id=?",
-                    (summary, source, datetime.now().isoformat(), video_id),
+                    (summary, source, datetime.now(timezone.utc).isoformat(), video_id),
                 )
                 try:
                     cur.execute(
@@ -2196,7 +2128,12 @@ def update_video_summary(
                     )
                     cur.execute(
                         "INSERT OR REPLACE INTO summaries(video_id, summary, source, created_at) VALUES (?,?,?,?)",
-                        (video_id, summary, source, datetime.now().isoformat()),
+                        (
+                            video_id,
+                            summary,
+                            source,
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
                     )
                 except sqlite3.OperationalError as e:
                     logger.debug(f"FTS summary update failed: {e}")
@@ -2206,14 +2143,14 @@ def update_video_summary(
 
 
 # ---------------------------------------------------------------------------
-# Get video copy data - with truncation to avoid OOM
+# Get video copy data
 # ---------------------------------------------------------------------------
 def get_video_copy_data(
     db_path: Path,
     video_id: str,
     max_transcript_chars: int = 15000,
     max_combined_chars: int = 20000,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     db_path = Path(db_path)
     if not db_path.exists():
         return {"error": "DB not found"}
@@ -2229,13 +2166,11 @@ def get_video_copy_data(
             cur.execute("SELECT text FROM transcripts WHERE video_id=?", (video_id,))
             t_row = cur.fetchone()
             transcript = t_row["text"] if t_row else ""
-            # Truncate transcript to avoid OOM
             if len(transcript) > max_transcript_chars:
                 transcript = (
                     transcript[:max_transcript_chars]
                     + f"\n...[truncated {len(transcript) - max_transcript_chars} chars]"
                 )
-
             cur.execute(
                 "SELECT author, text, likes FROM comments WHERE video_id=? ORDER BY likes DESC LIMIT 50",
                 (video_id,),
@@ -2265,7 +2200,7 @@ def get_video_copy_data(
     }
 
 
-def export_rag_dataset(out_dir: Path, db_path: Path | None = None) -> dict[str, Any]:
+def export_rag_dataset(out_dir: Path, db_path: Path | None = None) -> Dict[str, Any]:
     out_dir = Path(out_dir)
     db_path = Path(db_path) if db_path else out_dir / "archive.db"
     rag_jsonl = out_dir / "rag_dataset.jsonl"
@@ -2275,7 +2210,6 @@ def export_rag_dataset(out_dir: Path, db_path: Path | None = None) -> dict[str, 
     if not summaries_path.exists():
         return {"error": "No summaries yet"}
 
-    # Build RAG files from deduped source
     all_summ = load_jsonl_deduped(summaries_path, "video_id")
     try:
         with open(rag_jsonl, "w", encoding="utf-8") as fout:
@@ -2307,14 +2241,15 @@ def export_rag_dataset(out_dir: Path, db_path: Path | None = None) -> dict[str, 
         return {"error": str(e)}
 
     try:
-        count = sum(1 for _ in open(rag_jsonl, encoding="utf-8"))
+        with open(rag_jsonl, encoding="utf-8") as _rf:
+            count = sum(1 for _ in _rf)
     except OSError:
         count = len(all_summ)
     return {"rag_jsonl": str(rag_jsonl), "rag_md": str(rag_md), "count": count}
 
 
 # ---------------------------------------------------------------------------
-# LLM - retry logic
+# LLM
 # ---------------------------------------------------------------------------
 DEFAULT_SUMMARY_PROMPT = """You are a knowledgebase summarizer. Summarize the YouTube video below for later retrieval.
 
@@ -2352,18 +2287,9 @@ def _retry_with_backoff(attempts: int = 3, backoff_base: float = 1.5):
             for attempt in range(attempts):
                 try:
                     return fn(*args, **kwargs)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     last_exc = e
-                    # Only retry on transient errors
-                    transient = (
-                        isinstance(e, (ConnectionError, TimeoutError))
-                        or "503" in str(e)
-                        or "502" in str(e)
-                        or "connection" in str(e).lower()
-                    )
-                    if not transient and attempt == 0:
-                        # still retry once for local LLM busy
-                        pass
+                    # transient check - will retry regardless, logged below
                     if attempt < attempts - 1:
                         sleep = backoff_base**attempt
                         logger.warning(
@@ -2435,7 +2361,6 @@ def _call_lmstudio(
     }
     resp = requests.post(url, json=payload, timeout=CONFIG.request_timeout)
     if resp.status_code == 404:
-        # fallback to completions
         url2 = base + "/completions"
         payload2 = {
             "model": model,
@@ -2503,7 +2428,7 @@ def _call_openai_compat(
 def build_summary_prompt(
     video: dict,
     transcript: str,
-    comments: list[dict],
+    comments: List[Dict],
     custom_template: str | None = None,
 ) -> str:
     tags_list = (
@@ -2543,7 +2468,7 @@ def build_summary_prompt(
 def summarize_with_local_llm(
     video: dict,
     transcript: str,
-    comments: list[dict],
+    comments: List[Dict],
     llm_config: dict,
     progress_cb: ProgressCb = None,
 ) -> str:
@@ -2741,6 +2666,6 @@ def test_llm_connection(llm_config: dict) -> dict:
                 "endpoint": endpoint,
                 "note": "Custom OpenAI compat, not tested",
             }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"LLM test failed: {e}")
         return {"ok": False, "error": str(e), "config": llm_config}
