@@ -1,5 +1,4 @@
-yt-dlp
-youtube-transcript-api
-youtube-comment-downloader
-tqdm
-requests
+yt-dlp==2026.7.4
+youtube-transcript-api==1.2.4
+youtube-comment-downloader==0.1.83
+requests==2.34.2

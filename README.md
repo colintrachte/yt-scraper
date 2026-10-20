@@ -3,7 +3,7 @@
 
 Feed it a playlist URL and it scrapes everything in there.
 
-Windows batch installers and launchers are included.
+A single Windows launcher is included.
 
 ### What it does
 - Input: any public playlist or channel URL
@@ -18,17 +18,25 @@ Cost: $0.
 1. Install prerequisites:
    - Python 3.10+ from https://www.python.org/downloads/  CHECK "Add python.exe to PATH"
 
-2. Double-click `install.bat`.
+2. Double-click `START_YouTubeKnowledge.bat`. This is the only launcher you need. It creates the project environment and installs any missing dependencies automatically before opening the dashboard. Ready environments skip installation. Existing `venv` environments remain supported; new environments use `.venv`.
 
 3. Run a playlist:
    ```
-   run.bat "https://www.youtube.com/playlist?list=PLxxx"
+   START_YouTubeKnowledge.bat "https://www.youtube.com/playlist?list=PLxxx"
    ```
-   Double-click `run.bat` without arguments to open the local dashboard. The optional second argument is a video limit; omitting it uses zero (unlimited).
+   Double-click `START_YouTubeKnowledge.bat` without arguments to open the local dashboard. The optional second argument is a video limit; omitting it uses zero (unlimited).
+
+   The browser opens after the server is ready. Existing instances of this checkout are reused, and busy ports get a safe fallback. Keep the console open while using the dashboard; Ctrl+C stops a server started by that console. Diagnostics are in `logs/setup.log` and `logs/server.log`.
+
+   ```powershell
+   .\START_YouTubeKnowledge.bat --check
+   .\START_YouTubeKnowledge.bat --setup-only --update
+   .\START_YouTubeKnowledge.bat --no-browser --port 8768
+   ```
 
    Limit test:
    ```
-   run.bat "https://www.youtube.com/playlist?list=PLxxx" 20
+   START_YouTubeKnowledge.bat "https://www.youtube.com/playlist?list=PLxxx" 20
    ```
 
 4. Search:

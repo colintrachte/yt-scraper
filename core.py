@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
-"""
-core.py - Refactored knowledgebase core (FIXED)
-- Structured logging, type hints, dataclasses
-- Repository layer with context managers and migrations
-- Append-only JSONL with deduplication
-- Preserves DB on rebuild, single-open failure logs, transcript truncation
-- Retry logic for LLM calls
-Fixes:
-  - indentation crash in fetch_transcripts_bulk
-  - throttler service names (metadata vs transcripts vs comments)
-  - is_valid_video_id simplified to avoid PL-prefix false negatives
-  - GenericProxyConfig type-ignore for Pylance
-  - dedupe helpers
-"""
+"""YouTube discovery, retrieval, persistence, scoring, and export services."""
 
-from __future__ import annotations  # ruff: noqa: I001
+from __future__ import annotations
 
 import html
 import json
@@ -48,6 +35,7 @@ if not logger.handlers:
     )
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+logger.propagate = False
 
 ProgressCb = Callable[[str], None] | None
 CancelCheck = Callable[[], bool] | None
@@ -533,6 +521,68 @@ def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
         raise
 
 
+def read_completed_comment_ids(out_path: Path) -> set[str]:
+    """Return videos whose comment fetch completed, including zero-comment videos."""
+    out_path = Path(out_path)
+    completed = read_existing_ids_jsonl(
+        out_path.parent / "completed_comments.jsonl", key="video_id"
+    )
+    if out_path.exists():
+        completed.update(read_existing_ids_jsonl(out_path, key="video_id"))
+    return completed
+
+
+def load_unresolved_failures(out_dir: Path) -> list[Dict[str, Any]]:
+    """Load the latest failures, excluding work that later succeeded."""
+    out_dir = Path(out_dir)
+    completed_metadata = read_existing_ids_jsonl(
+        out_dir / "videos_full.jsonl", key="id"
+    )
+    completed_transcripts = {
+        video_id
+        for video_id, record in load_jsonl_deduped(
+            out_dir / "transcripts.jsonl", key="video_id"
+        ).items()
+        if record.get("text")
+    }
+    completed_comments = read_completed_comment_ids(out_dir / "comments.jsonl")
+    failures: dict[tuple[str, str], Dict[str, Any]] = {}
+
+    for path in (
+        out_dir / "failed_metadata.jsonl",
+        out_dir / "failed_transcripts.jsonl",
+        out_dir / "failed_comments.jsonl",
+    ):
+        if not path.exists():
+            continue
+        default_type = path.stem.removeprefix("failed_")
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as failure_file:
+                for line in failure_file:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    video_id = record.get("video_id")
+                    failure_type = record.get("type") or default_type
+                    if video_id:
+                        failures[(video_id, failure_type)] = record
+        except OSError as error:
+            logger.warning(f"Failed to read {path}: {error}")
+
+    unresolved = []
+    for (video_id, failure_type), record in failures.items():
+        category = str(failure_type).split("_", 1)[0]
+        if category == "metadata" and video_id in completed_metadata:
+            continue
+        if category == "transcript" and video_id in completed_transcripts:
+            continue
+        if category == "comments" and video_id in completed_comments:
+            continue
+        unresolved.append(record)
+    return unresolved
+
+
 def rewrite_jsonl_deduped(path: Path, records: Dict[str, Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -815,11 +865,13 @@ def get_playlist_data(
                                 "duration": e.get("duration") or 0,
                                 "view_count": e.get("view_count") or 0,
                             }
-                        mappings.append({
-                            "playlist_id": playlist_id,
-                            "video_id": vid,
-                            "position": pos,
-                        })
+                        mappings.append(
+                            {
+                                "playlist_id": playlist_id,
+                                "video_id": vid,
+                                "position": pos,
+                            }
+                        )
                         if limit and len(all_videos) >= limit:
                             break
                     if all_videos and is_playlist_attempt and p_id:
@@ -856,11 +908,13 @@ def get_playlist_data(
                                 "tags": [],
                                 "meta_json": "",
                             }
-                        mappings.append({
-                            "playlist_id": p_id,
-                            "video_id": vid,
-                            "position": 0,
-                        })
+                        mappings.append(
+                            {
+                                "playlist_id": p_id,
+                                "video_id": vid,
+                                "position": 0,
+                            }
+                        )
         except Exception as e:  # noqa: BLE001
             _log(f"Attempt {attempt_url} failed: {e}", progress_cb)
 
@@ -1070,11 +1124,13 @@ def _fetch_transcript_ytdlp_fallback(
         ev_segs = ev.get("segs") or []
         txt = "".join(s.get("utf8", "") for s in ev_segs).strip()
         if txt and txt != "\n":
-            segs.append({
-                "text": txt,
-                "start": float(t_start),
-                "duration": float(t_dur),
-            })
+            segs.append(
+                {
+                    "text": txt,
+                    "start": float(t_start),
+                    "duration": float(t_dur),
+                }
+            )
             full_text.append(txt)
 
     if not segs:
@@ -1284,8 +1340,6 @@ def fetch_comments_bulk(
         from youtube_comment_downloader import YoutubeCommentDownloader
     except ImportError:
         _log("youtube-comment-downloader not installed, skipping comments", progress_cb)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text("", encoding="utf-8")
         return
 
     cfg = config or CONFIG
@@ -1295,19 +1349,8 @@ def fetch_comments_bulk(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     failures_path = out_path.parent / "failed_comments.jsonl"
-    existing_vids: set[str] = set()
-    if resume and out_path.exists():
-        try:
-            with open(out_path, encoding="utf-8", errors="ignore") as rf:
-                for line in rf:
-                    try:
-                        j = json.loads(line)
-                        if j.get("video_id"):
-                            existing_vids.add(j["video_id"])
-                    except json.JSONDecodeError:
-                        continue
-        except OSError as e:
-            logger.warning(f"Failed to read comments for resume: {e}")
+    completed_path = out_path.parent / "completed_comments.jsonl"
+    existing_vids = read_completed_comment_ids(out_path) if resume else set()
 
     downloader = YoutubeCommentDownloader()
     total = 0
@@ -1343,13 +1386,15 @@ def fetch_comments_bulk(
                         text = cm.get("text", "")
                         if not text:
                             continue
-                        batch.append({
-                            "video_id": vid,
-                            "author": cm.get("author", ""),
-                            "text": text,
-                            "votes": parse_vote_count(cm.get("votes")),
-                            "time": cm.get("time", ""),
-                        })
+                        batch.append(
+                            {
+                                "video_id": vid,
+                                "author": cm.get("author", ""),
+                                "text": text,
+                                "votes": parse_vote_count(cm.get("votes")),
+                                "time": cm.get("time", ""),
+                            }
+                        )
                         if limit and len(batch) >= limit:
                             break
                     if cancel_check and cancel_check():
@@ -1359,6 +1404,15 @@ def fetch_comments_bulk(
                         json.dumps(rec, ensure_ascii=False) + "\n" for rec in batch
                     )
                     f_out.flush()
+                    append_jsonl(
+                        completed_path,
+                        {
+                            "video_id": vid,
+                            "comment_count": len(batch),
+                            "completed_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    existing_vids.add(vid)
                     total += len(batch)
                     throttler.record_success()
                     _log(f"[comments OK] {vid}: {len(batch)}", progress_cb)
@@ -1694,26 +1748,13 @@ def build_db(
     all_vids = _load_videos_full(out_dir)
     transcript_map = _load_transcript_map(out_dir)
     comment_stats = _load_comment_stats(out_dir)
-
-    failed_ids: set[str] = set()
-    for fp in [
-        out_dir / "failed_transcripts.jsonl",
-        out_dir / "failed_comments.jsonl",
-        out_dir / "failed_metadata.jsonl",
-    ]:
-        if not fp.exists():
-            continue
-        try:
-            with open(fp, encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    try:
-                        j = json.loads(line)
-                        if j.get("video_id"):
-                            failed_ids.add(j["video_id"])
-                    except json.JSONDecodeError:
-                        continue
-        except OSError as e:
-            logger.debug(f"Failed to read failure file {fp}: {e}")
+    unresolved_failures = load_unresolved_failures(out_dir)
+    failed_transcript_ids = {
+        record["video_id"]
+        for record in unresolved_failures
+        if record.get("video_id")
+        and str(record.get("type", "transcript")).startswith("transcript")
+    }
 
     playlist_count_map: Dict[str, int] = {}
     for m in mappings_raw:
@@ -1727,20 +1768,18 @@ def build_db(
     with db_connection(db_path) as conn:
         ensure_schema(conn)
         cur = conn.cursor()
-        try:
-            cur.execute("DELETE FROM videos_fts")
-            cur.execute("DELETE FROM transcripts_fts")
-            cur.execute("DELETE FROM comments_fts")
-            cur.execute("DELETE FROM playlists_fts")
-            cur.execute("DELETE FROM summaries_fts")
-            cur.execute("DELETE FROM playlist_videos")
-            cur.execute("DELETE FROM playlists")
-            cur.execute("DELETE FROM transcripts")
-            cur.execute("DELETE FROM comments")
-            cur.execute("DELETE FROM failures")
-            cur.execute("DELETE FROM summaries")
-        except sqlite3.OperationalError as e:
-            logger.debug(f"Clear tables note: {e}")
+        cur.execute("DELETE FROM videos_fts")
+        cur.execute("DELETE FROM transcripts_fts")
+        cur.execute("DELETE FROM comments_fts")
+        cur.execute("DELETE FROM playlists_fts")
+        cur.execute("DELETE FROM summaries_fts")
+        cur.execute("DELETE FROM playlist_videos")
+        cur.execute("DELETE FROM playlists")
+        cur.execute("DELETE FROM transcripts")
+        cur.execute("DELETE FROM comments")
+        cur.execute("DELETE FROM failures")
+        cur.execute("DELETE FROM summaries")
+        cur.execute("DELETE FROM videos")
 
         pl_batch = []
         fts_batch = []
@@ -1748,23 +1787,27 @@ def build_db(
             pid = j.get("playlist_id")
             if not pid:
                 continue
-            pl_batch.append((
-                pid,
-                j.get("title", ""),
-                j.get("description", ""),
-                j.get("channel", ""),
-                j.get("channel_id", ""),
-                j.get("uploader", ""),
-                j.get("video_count", 0),
-                j.get("url", ""),
-                json.dumps(j, ensure_ascii=False),
-            ))
-            fts_batch.append((
-                pid,
-                j.get("title", ""),
-                j.get("description", ""),
-                j.get("channel", ""),
-            ))
+            pl_batch.append(
+                (
+                    pid,
+                    j.get("title", ""),
+                    j.get("description", ""),
+                    j.get("channel", ""),
+                    j.get("channel_id", ""),
+                    j.get("uploader", ""),
+                    j.get("video_count", 0),
+                    j.get("url", ""),
+                    json.dumps(j, ensure_ascii=False),
+                )
+            )
+            fts_batch.append(
+                (
+                    pid,
+                    j.get("title", ""),
+                    j.get("description", ""),
+                    j.get("channel", ""),
+                )
+            )
             if len(pl_batch) >= 200:
                 cur.executemany(
                     "INSERT OR REPLACE INTO playlists VALUES (?,?,?,?,?,?,?, ?, ?)",
@@ -1811,11 +1854,11 @@ def build_db(
                     j, trans, cstats, pcount, chcount
                 )
                 status = "ok"
-                if vid in failed_ids and not trans:
+                if vid in failed_transcript_ids and not trans:
                     status = "no_transcript"
-                if not trans and not j.get("description"):
+                elif not trans and not j.get("description"):
                     status = "needs_review"
-                if trans and len(trans.get("text", "").split()) < 100:
+                elif trans and len(trans.get("text", "").split()) < 100:
                     status = "short_transcript"
 
                 ps = merged_scores.get(vid, {})
@@ -1827,44 +1870,48 @@ def build_db(
                 summary_date = summ.get("created_at", "")
 
                 tags_str = " ".join(j.get("tags") or [])
-                v_batch.append((
-                    vid,
-                    j.get("title", ""),
-                    j.get("description", ""),
-                    j.get("channel", ""),
-                    j.get("channel_id", ""),
-                    j.get("uploader", ""),
-                    j.get("upload_date", ""),
-                    j.get("timestamp", 0),
-                    j.get("duration", 0),
-                    j.get("view_count", 0),
-                    j.get("like_count", 0),
-                    j.get("comment_count", 0)
-                    or (cstats.get("count", 0) if cstats else 0),
-                    json.dumps(j.get("tags") or []),
-                    json.dumps(j.get("categories") or []),
-                    j.get("thumbnail", ""),
-                    j.get("url", ""),
-                    j.get("language", ""),
-                    json.dumps(j.get("chapters") or []),
-                    score,
-                    details.get("label", ""),
-                    json.dumps(details, ensure_ascii=False),
-                    user_score,
-                    user_notes,
-                    summary,
-                    summary_source,
-                    summary_date,
-                    status,
-                    json.dumps(j, ensure_ascii=False),
-                ))
-                v_fts.append((
-                    vid,
-                    j.get("title", ""),
-                    (j.get("description", "") or "")[:5000],
-                    tags_str,
-                    j.get("channel", ""),
-                ))
+                v_batch.append(
+                    (
+                        vid,
+                        j.get("title", ""),
+                        j.get("description", ""),
+                        j.get("channel", ""),
+                        j.get("channel_id", ""),
+                        j.get("uploader", ""),
+                        j.get("upload_date", ""),
+                        j.get("timestamp", 0),
+                        j.get("duration", 0),
+                        j.get("view_count", 0),
+                        j.get("like_count", 0),
+                        j.get("comment_count", 0)
+                        or (cstats.get("count", 0) if cstats else 0),
+                        json.dumps(j.get("tags") or []),
+                        json.dumps(j.get("categories") or []),
+                        j.get("thumbnail", ""),
+                        j.get("url", ""),
+                        j.get("language", ""),
+                        json.dumps(j.get("chapters") or []),
+                        score,
+                        details.get("label", ""),
+                        json.dumps(details, ensure_ascii=False),
+                        user_score,
+                        user_notes,
+                        summary,
+                        summary_source,
+                        summary_date,
+                        status,
+                        json.dumps(j, ensure_ascii=False),
+                    )
+                )
+                v_fts.append(
+                    (
+                        vid,
+                        j.get("title", ""),
+                        (j.get("description", "") or "")[:5000],
+                        tags_str,
+                        j.get("channel", ""),
+                    )
+                )
                 if len(v_batch) >= 500:
                     cur.executemany(
                         "INSERT OR REPLACE INTO videos VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1891,16 +1938,18 @@ def build_db(
             if not is_valid_video_id(vid):
                 continue
             wc = len(j.get("text", "").split())
-            t_batch.append((
-                vid,
-                j.get("title", ""),
-                j.get("url", ""),
-                j.get("channel", ""),
-                j.get("channel_id", ""),
-                j.get("text", ""),
-                wc,
-                json.dumps(j, ensure_ascii=False),
-            ))
+            t_batch.append(
+                (
+                    vid,
+                    j.get("title", ""),
+                    j.get("url", ""),
+                    j.get("channel", ""),
+                    j.get("channel_id", ""),
+                    j.get("text", ""),
+                    wc,
+                    json.dumps(j, ensure_ascii=False),
+                )
+            )
             tf_batch.append((vid, j.get("title", ""), j.get("text", "")))
             if len(t_batch) >= 500:
                 cur.executemany(
@@ -1934,19 +1983,23 @@ def build_db(
                             likes = parse_vote_count(
                                 j.get("votes") if "votes" in j else j.get("likes")
                             )
-                            c_batch.append((
-                                j.get("video_id", ""),
-                                j.get("author", ""),
-                                j.get("text", ""),
-                                likes,
-                                j.get("time", ""),
-                                json.dumps(j, ensure_ascii=False),
-                            ))
-                            cf_batch.append((
-                                j.get("video_id", ""),
-                                j.get("author", ""),
-                                j.get("text", ""),
-                            ))
+                            c_batch.append(
+                                (
+                                    j.get("video_id", ""),
+                                    j.get("author", ""),
+                                    j.get("text", ""),
+                                    likes,
+                                    j.get("time", ""),
+                                    json.dumps(j, ensure_ascii=False),
+                                )
+                            )
+                            cf_batch.append(
+                                (
+                                    j.get("video_id", ""),
+                                    j.get("author", ""),
+                                    j.get("text", ""),
+                                )
+                            )
                             if len(c_batch) >= 1000:
                                 cur.executemany(
                                     "INSERT INTO comments(video_id, author, text, likes, time, json) VALUES (?,?,?,?,?,?)",
@@ -1968,33 +2021,18 @@ def build_db(
                 )
                 cur.executemany("INSERT INTO comments_fts VALUES (?,?,?)", cf_batch)
 
-        for fp in [
-            out_dir / "failed_transcripts.jsonl",
-            out_dir / "failed_comments.jsonl",
-            out_dir / "failed_metadata.jsonl",
-        ]:
-            if not fp.exists():
-                continue
-            try:
-                with open(fp, encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        try:
-                            j = json.loads(line)
-                            cur.execute(
-                                "INSERT INTO failures(video_id, type, error, url, title, timestamp) VALUES (?,?,?,?,?,?)",
-                                (
-                                    j.get("video_id"),
-                                    j.get("type") or fp.stem.replace("failed_", ""),
-                                    j.get("error", ""),
-                                    j.get("url", ""),
-                                    j.get("title", ""),
-                                    datetime.now(timezone.utc).isoformat(),
-                                ),
-                            )
-                        except json.JSONDecodeError:
-                            continue
-            except OSError as e:
-                logger.debug(f"Failed reading {fp}: {e}")
+        for failure in unresolved_failures:
+            cur.execute(
+                "INSERT INTO failures(video_id, type, error, url, title, timestamp) VALUES (?,?,?,?,?,?)",
+                (
+                    failure.get("video_id"),
+                    failure.get("type") or "unknown",
+                    failure.get("error", ""),
+                    failure.get("url", ""),
+                    failure.get("title", ""),
+                    failure.get("timestamp") or datetime.now(timezone.utc).isoformat(),
+                ),
+            )
 
         for vid, s in merged_summaries.items():
             try:
@@ -2439,10 +2477,12 @@ def build_summary_prompt(
     tags = ", ".join(tags_list[:15]) if isinstance(tags_list, list) else ""
     desc = (video.get("description") or "")[:2000]
     trans = (transcript or "")[:12000]
-    comm_text = "\n".join([
-        f"- {c.get('author', '')}: {c.get('text', '')[:200]}"
-        for c in (comments or [])[:15]
-    ])
+    comm_text = "\n".join(
+        [
+            f"- {c.get('author', '')}: {c.get('text', '')[:200]}"
+            for c in (comments or [])[:15]
+        ]
+    )
     template = custom_template or DEFAULT_SUMMARY_PROMPT
     try:
         return template.format(

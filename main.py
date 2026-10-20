@@ -1,36 +1,27 @@
 #!/usr/bin/env python3
-"""
-main.py - Refactored orchestration + UX-rich server (FIXED)
-Fixes:
- - XSS: adds esc() and uses it everywhere
- - Cancel button relabeled to Stop & Save with tooltip
- - Failures deduped (video_id+type) to avoid duplicate rows
- - Cookies/proxy warnings added
- - Removed unused imports, sorted imports, tightened blind excepts
- - parse_url_input improved, _ensure_venv safer
-"""
+"""Local web dashboard and archive-job orchestration."""
 
-from __future__ import annotations  # ruff: noqa: I001
+from __future__ import annotations
 
 import argparse
 import importlib
 import json
 import logging
 import os
-import platform
 import socket
-import subprocess
 import sys
 import threading
 import time
 import webbrowser
+from dataclasses import replace
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from core import (
     CONFIG,
+    PACING_PROFILES,
     ThrottleAbort,
     build_db,
     export_rag_dataset,
@@ -40,14 +31,17 @@ from core import (
     generate_summary_for_video,
     get_video_copy_data,
     highlight_search_snippet,
+    is_valid_video_id,
+    load_unresolved_failures,
     make_throttler,
+    read_completed_comment_ids,
+    read_existing_ids_jsonl,
     test_llm_connection,
     update_video_summary,
     update_video_user_score,
-    read_existing_ids_jsonl,
 )
 from core import get_playlist_data as core_get_playlist_data
-from search import search_videos as search_search_videos  # type: ignore[attr-defined]
+from search import search as search_search_videos
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -56,14 +50,6 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger("ytkb.main")
-
-# ---------------------------------------------------------------------------
-# Optional UI helpers
-# ---------------------------------------------------------------------------
-try:
-    from tqdm import tqdm
-except ImportError:
-    tqdm = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # HTML - fixed for XSS + UX notes
@@ -311,15 +297,22 @@ async function startArchive(){
   const body={urls, options:opts};
   document.getElementById('start').classList.add('hidden');
   document.getElementById('cancel').classList.remove('hidden');
-  const res=await fetch('/api/archive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j=await res.json();
-  if(!j.ok){ alert('Start failed: '+(j.error||'')); document.getElementById('start').classList.remove('hidden'); document.getElementById('cancel').classList.add('hidden'); return; }
-  pollTimer=setInterval(pollNow, 900);
+  try {
+    const res=await fetch('/api/archive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await res.json();
+    if(!res.ok || !j.ok) throw new Error(j.error||('HTTP '+res.status));
+    await pollNow();
+    pollTimer=setInterval(pollNow, 900);
+  } catch(error) {
+    alert('Start failed: '+error.message);
+    document.getElementById('start').classList.remove('hidden');
+    document.getElementById('cancel').classList.add('hidden');
+  }
 }
 async function cancelArchive(){
   await fetch('/api/cancel',{method:'POST'});
   document.getElementById('cancel').classList.add('hidden');
-  document.getElementById('start').classList.remove('hidden');
+  document.getElementById('stage-details').textContent='Stopping safely and rebuilding the searchable database...';
 }
 async function pollNow(){
   const res=await fetch('/api/status'); const j=await res.json();
@@ -327,8 +320,9 @@ async function pollNow(){
   document.getElementById('stage-details').textContent=j.stage_details||'';
   const pct=j.total ? Math.min(100, Math.round((j.done/j.total)*100)) : 0;
   document.getElementById('bar').style.width=pct+'%';
-  document.getElementById('health-text').textContent=j.running ? (j.stage+'... '+pct+'%') : 'Idle';
-  document.getElementById('health-dot').className='dot '+(j.running?'warn':'ok');
+  const failedState=j.stage==='error';
+  document.getElementById('health-text').textContent=j.running ? (j.stage+'... '+pct+'%') : (failedState?'Error':(j.stage||'Idle'));
+  document.getElementById('health-dot').className='dot '+(j.running?'warn':(failedState?'bad':'ok'));
   document.getElementById('counts').textContent=`done ${j.done||0}/${j.total||0} ok=${j.ok||0} fail=${j.failed||0}`;
   document.getElementById('timer').textContent=j.elapsed ? (j.elapsed+'s') : '';
   const logsEl=document.getElementById('logs');
@@ -336,7 +330,12 @@ async function pollNow(){
   logsEl.textContent=tail;
   logsEl.scrollTop=logsEl.scrollHeight;
   if(j.stats){ renderStats(j.stats); }
-  if(!j.running && pollTimer){ clearInterval(pollTimer); pollTimer=null; document.getElementById('start').classList.remove('hidden'); document.getElementById('cancel').classList.add('hidden'); }
+  if(!j.running && pollTimer){
+    clearInterval(pollTimer); pollTimer=null;
+    document.getElementById('start').classList.remove('hidden');
+    document.getElementById('cancel').classList.add('hidden');
+    await loadStats(); await loadVideos();
+  }
 }
 function renderStats(s){
   document.getElementById('counts').textContent=`videos ${s.videos||0} playlists ${s.playlists||0} avgQ ${s.avg_quality||0}`;
@@ -385,7 +384,7 @@ async function loadCopyData(){
     <div class="kv"><div>Title</div><div>${esc(j.video.title||'')} <button class="btn ghost" onclick="copyField('title')">Copy</button></div></div>
     <div class="kv"><div>URL</div><div>${esc(j.video.url||'')} <button class="btn ghost" onclick="copyField('url')">Copy</button></div></div>
     <div class="kv"><div>Channel</div><div>${esc(j.video.channel||'')} <button class="btn ghost" onclick="copyField('channel')">Copy</button></div></div>
-    <div class="kv"><div>Tags</div><div>${(j.video.tags||'').slice(0,500)} <button class="btn ghost" onclick="copyField('tags')">Copy</button></div></div>
+    <div class="kv"><div>Tags</div><div>${esc((j.video.tags||'').slice(0,500))} <button class="btn ghost" onclick="copyField('tags')">Copy</button></div></div>
     <div class="kv"><div>Transcript len</div><div>${esc((j.transcript||'').length)} chars <button class="btn ghost" onclick="copyField('transcript')">Copy</button></div></div>
   `;
   document.getElementById('combined').value=j.combined_for_ai||'';
@@ -457,8 +456,6 @@ IMPORT_MAP = {
     "youtube-transcript-api": "youtube_transcript_api",
     "youtube-comment-downloader": "youtube_comment_downloader",
     "requests": "requests",
-    "tqdm": "tqdm",
-    "pillow": "PIL",
 }
 
 STATE = {
@@ -508,58 +505,17 @@ def _missing() -> list[str]:
     return miss
 
 
-def _install(pkgs: list[str]) -> bool:
-    if not pkgs:
-        return True
-    py = sys.executable
-    try:
-        subprocess.check_call(
-            [py, "-m", "pip", "install", "-U", "pip", "wheel", "setuptools"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-        )
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"pip upgrade failed: {e}")
-    try:
-        subprocess.check_call([py, "-m", "pip", "install", *pkgs])
-        return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"pip install {pkgs} failed: {e}")
-        return False
-
-
 def _ensure_venv() -> None:
-    if VENV_DIR.exists():
-        return
-    try:
-        import venv
+    from helper_scripts.launch_support import ensure_environment
 
-        _log("Creating .venv with stdlib venv")
-        venv.create(str(VENV_DIR), with_pip=True)
-        py = VENV_DIR / (
-            "Scripts/python.exe" if platform.system() == "Windows" else "bin/python"
+    root = Path(__file__).resolve().parent
+    python = ensure_environment(root, (3, 10))
+    os.chdir(root)
+    if python.resolve() != Path(sys.executable).resolve():
+        os.execv(
+            str(python),
+            [str(python), str(root / "main.py"), *sys.argv[1:], "--no-venv"],
         )
-        if py.exists():
-            _log(f"Re-exec with {py}")
-            os.execv(str(py), [str(py), *sys.argv])
-    except (OSError, ValueError, ImportError) as e:
-        logger.debug(f"venv creation failed, fallback to virtualenv: {e}")
-        try:
-            subprocess.check_call([
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "virtualenv",
-            ])
-            subprocess.check_call([sys.executable, "-m", "virtualenv", str(VENV_DIR)])
-            py = VENV_DIR / (
-                "Scripts/python.exe" if platform.system() == "Windows" else "bin/python"
-            )
-            if py.exists():
-                os.execv(str(py), [str(py), *sys.argv])
-        except (OSError, subprocess.CalledProcessError, ValueError) as e2:
-            logger.warning(f"virtualenv fallback failed: {e2}")
 
 
 def find_free_port(preferred: int = DEFAULT_PORT) -> int:
@@ -614,6 +570,88 @@ def parse_url_input(raw: str) -> list[str]:
     return out
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Replace a text file only after its complete replacement is on disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _merge_jsonl(path: Path, records: list[dict], key_fn) -> None:
+    """Merge records into a JSONL file without discarding earlier runs."""
+    merged: dict[object, dict] = {}
+    if path.exists():
+        with open(path, encoding="utf-8", errors="ignore") as existing_file:
+            for line in existing_file:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = key_fn(record)
+                if key:
+                    merged[key] = record
+
+    for record in records:
+        key = key_fn(record)
+        if key:
+            merged[key] = {**merged.get(key, {}), **record}
+
+    _atomic_write(
+        path,
+        "".join(
+            json.dumps(record, ensure_ascii=False) + "\n" for record in merged.values()
+        ),
+    )
+
+
+def persist_discovery(
+    videos: list[dict], playlists: list[dict], mappings: list[dict], out_dir: Path
+) -> None:
+    """Persist discovery results cumulatively so resume runs cannot erase data."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    meta_path = out_dir / "videos_meta.json"
+    merged_videos: dict[str, dict] = {}
+    if meta_path.exists():
+        try:
+            previous = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(previous, list):
+                for record in previous:
+                    if isinstance(record, dict) and record.get("id"):
+                        merged_videos[record["id"]] = record
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Could not read %s; rebuilding it from this run", meta_path)
+
+    for record in videos:
+        video_id = record.get("id")
+        if video_id:
+            merged_videos[video_id] = {
+                **merged_videos.get(video_id, {}),
+                **record,
+            }
+
+    _atomic_write(
+        meta_path,
+        json.dumps(list(merged_videos.values()), indent=2, ensure_ascii=False),
+    )
+    _atomic_write(out_dir / "videos.txt", "\n".join(merged_videos))
+    _merge_jsonl(
+        out_dir / "playlists.jsonl",
+        playlists,
+        lambda record: record.get("playlist_id"),
+    )
+    _merge_jsonl(
+        out_dir / "playlist_videos.jsonl",
+        mappings,
+        lambda record: (
+            (record.get("playlist_id"), record.get("video_id"))
+            if record.get("playlist_id") and record.get("video_id")
+            else None
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Archive job - FIXED throttler usage + dedupe
 # ---------------------------------------------------------------------------
@@ -623,18 +661,29 @@ def archive_job(urls: list[str], opts: dict) -> None:
 
     with LOCK:
         STATE["out_dir"] = str(out_dir.resolve())
-        STATE["cancel"] = False
+        STATE["running"] = True
+        STATE["start_ts"] = time.time()
+        STATE["done"] = 0
+        STATE["total"] = len(urls)
+        STATE["ok"] = 0
+        STATE["failed"] = 0
+        STATE["logs"] = []
+        STATE["stats"] = None
 
-    # build config from UI opts
-    cfg = CONFIG
+    # Each job gets an isolated configuration. Mutating CONFIG leaked one run's
+    # cookies, proxy, output path, and pacing choices into later runs.
+    cfg = replace(CONFIG)
     cfg.out_dir = out_dir
-    cfg.pacing_mode = opts.get("pacing") or cfg.pacing_mode
+    requested_pacing = str(opts.get("pacing") or cfg.pacing_mode).lower()
+    cfg.pacing_mode = (
+        requested_pacing if requested_pacing in PACING_PROFILES else "conservative"
+    )
     try:
-        cfg.chunk_size = int(opts.get("chunk") or cfg.chunk_size)
+        cfg.chunk_size = max(1, int(opts.get("chunk") or cfg.chunk_size))
     except (ValueError, TypeError):
         pass
     try:
-        cfg.chunk_pause_sec = float(opts.get("pause") or cfg.chunk_pause_sec)
+        cfg.chunk_pause_sec = max(0.0, float(opts.get("pause") or cfg.chunk_pause_sec))
     except (ValueError, TypeError):
         pass
     cfg.cookies_browser = opts.get("cookies_browser") or None
@@ -653,28 +702,54 @@ def archive_job(urls: list[str], opts: dict) -> None:
 
     def progress_cb(msg: str) -> None:
         _log(msg)
+        outcome = None
+        if any(
+            token in msg for token in ("[meta OK]", "[transcript OK]", "[comments OK]")
+        ):
+            outcome = "ok"
+        elif any(
+            token in msg
+            for token in (
+                "[meta FAIL]",
+                "[transcript NONE]",
+                "[transcript FAIL]",
+                "[comments FAIL]",
+            )
+        ):
+            outcome = "failed"
+        if outcome:
+            with LOCK:
+                STATE["done"] = min(STATE["total"], STATE["done"] + 1)
+                STATE[outcome] += 1
 
-    try:
+    def set_work_stage(name: str, total: int, details: str = "") -> None:
         with LOCK:
-            STATE["running"] = True
-            STATE["start_ts"] = time.time()
             STATE["done"] = 0
-            STATE["total"] = len(urls)
+            STATE["total"] = total
             STATE["ok"] = 0
             STATE["failed"] = 0
-            STATE["logs"] = []
+        set_stage(name, details or f"{total} remaining")
 
+    try:
         # STAGE 1 discovery
-        set_stage("discovery", f"{len(urls)} input URLs, mode={cfg.pacing_mode}")
+        set_work_stage(
+            "discovery",
+            len(urls),
+            f"{len(urls)} input URLs, mode={cfg.pacing_mode}",
+        )
         all_videos: dict[str, dict] = {}
         all_playlists: dict[str, dict] = {}
         all_mappings: list[dict] = []
+        interrupted = ""
 
         for u in urls:
             if cancel_check():
-                _log("Cancelled before discovery")
+                interrupted = "Stopped by user during discovery"
                 break
-            limit = int(opts.get("limit") or 0)
+            try:
+                limit = max(0, int(opts.get("limit") or 0))
+            except (TypeError, ValueError):
+                limit = 0
             try:
                 vids, pls, maps = core_get_playlist_data(
                     u,
@@ -689,166 +764,129 @@ def archive_job(urls: list[str], opts: dict) -> None:
                 for p in pls:
                     all_playlists[p["playlist_id"]] = p
                 all_mappings.extend(maps)
+                with LOCK:
+                    STATE["done"] += 1
+                    STATE["ok"] += 1
             except ThrottleAbort as e:
-                _log(f"ThrottleAbort in discovery: {e}")
+                interrupted = str(e)
+                _log(f"Discovery paused: {e}")
                 break
             except Exception as e:
                 _log(f"Discovery error for {u}: {e}")
                 logger.exception(f"Discovery error for {u}")
+                with LOCK:
+                    STATE["done"] += 1
+                    STATE["failed"] += 1
 
-        # write discovery JSONL deduped
-        pl_path = out_dir / "playlists.jsonl"
-        pv_path = out_dir / "playlist_videos.jsonl"
-        try:
-            with open(pl_path, "w", encoding="utf-8") as f:
-                for p in all_playlists.values():
-                    f.write(json.dumps(p, ensure_ascii=False) + "\n")
-            with open(pv_path, "w", encoding="utf-8") as f:
-                # dedupe mappings
-                seen_m = set()
-                for m in all_mappings:
-                    key = (m["playlist_id"], m["video_id"])
-                    if key in seen_m:
-                        continue
-                    seen_m.add(key)
-                    f.write(json.dumps(m, ensure_ascii=False) + "\n")
-        except OSError as e:
-            logger.error(f"Failed to write discovery files: {e}")
+        persist_discovery(
+            list(all_videos.values()),
+            list(all_playlists.values()),
+            all_mappings,
+            out_dir,
+        )
 
         video_ids = list(all_videos.keys())
-        with LOCK:
-            STATE["total"] = len(video_ids)
         _log(f"Discovered {len(video_ids)} unique videos")
-
-        # [NEW] Resume detection - zero wasted API calls
-        try:
-            existing_meta = (
-                read_existing_ids_jsonl(out_dir / "videos_full.jsonl", key="id")
-                if (out_dir / "videos_full.jsonl").exists()
-                else set()
+        if not video_ids and not interrupted:
+            raise RuntimeError(
+                "No videos were discovered. Check that the URL is public and review the log for the YouTube error."
             )
-            existing_trans = (
-                read_existing_ids_jsonl(out_dir / "transcripts.jsonl", key="video_id")
-                if (out_dir / "transcripts.jsonl").exists()
-                else set()
-            )
-            existing_comm = set()
-            comm_path = out_dir / "comments.jsonl"
-            if comm_path.exists():
-                try:
-                    with open(comm_path, encoding="utf-8", errors="ignore") as rf:
-                        for line in rf:
-                            try:
-                                j = json.loads(line)
-                                if j.get("video_id"):
-                                    existing_comm.add(j["video_id"])
-                            except json.JSONDecodeError:
-                                continue
-                except OSError:
-                    pass
-            if existing_meta or existing_trans or existing_comm:
-                new_vids = [v for v in video_ids if v not in existing_meta]
-                trans_remaining = [v for v in video_ids if v not in existing_trans]
-                comm_remaining = [v for v in video_ids if v not in existing_comm]
-                _log(
-                    f"RESUME detected in {out_dir}: "
-                    f"{len(existing_meta)} metadata already, "
-                    f"{len(existing_trans)} transcripts already, "
-                    f"{len(existing_comm)} comment sets already. "
-                    f"{len(new_vids)} new videos need metadata, "
-                    f"{len(trans_remaining)} need transcripts, "
-                    f"{len(comm_remaining)} need comments. No API calls will be wasted."
-                )
-                with LOCK:
-                    STATE["stage_details"] = (
-                        f"Resume: {len(existing_meta)}/{len(video_ids)} meta done, "
-                        f"{len(existing_trans)}/{len(video_ids)} transcripts done, "
-                        f"{len(existing_comm)}/{len(video_ids)} comments done"
-                    )
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"Resume detection failed: {e}")
 
-        if cancel_check():
-            raise RuntimeError("Cancelled after discovery")
+        existing_meta = read_existing_ids_jsonl(out_dir / "videos_full.jsonl", key="id")
+        existing_trans = read_existing_ids_jsonl(
+            out_dir / "transcripts.jsonl", key="video_id"
+        )
+        existing_comm = read_completed_comment_ids(out_dir / "comments.jsonl")
+        metadata_remaining = [v for v in video_ids if v not in existing_meta]
+        transcript_remaining = [v for v in video_ids if v not in existing_trans]
+        comments_remaining = [v for v in video_ids if v not in existing_comm]
+        if existing_meta or existing_trans or existing_comm:
+            _log(
+                f"Resume: {len(metadata_remaining)} metadata, "
+                f"{len(transcript_remaining)} transcripts, and "
+                f"{len(comments_remaining)} comment sets remain."
+            )
+        if cancel_check() and not interrupted:
+            interrupted = "Stopped by user after discovery"
 
         # STAGE 2 metadata
-        set_stage("metadata", f"{len(video_ids)} videos")
-        try:
-            fetch_videos_full_metadata(
-                video_ids,
-                out_dir / "videos_full.jsonl",
-                progress_cb=progress_cb,
-                resume=True,
-                cancel_check=cancel_check,
-                throttler=metadata_throttler,
-                config=cfg,
-            )
-        except ThrottleAbort as e:
-            _log(f"ThrottleAbort in metadata: {e}")
-
-        if cancel_check():
-            raise RuntimeError("Cancelled after metadata")
+        if not interrupted:
+            set_work_stage("metadata", len(metadata_remaining))
+            try:
+                fetch_videos_full_metadata(
+                    metadata_remaining,
+                    out_dir / "videos_full.jsonl",
+                    progress_cb=progress_cb,
+                    resume=True,
+                    cancel_check=cancel_check,
+                    throttler=metadata_throttler,
+                    config=cfg,
+                )
+            except ThrottleAbort as e:
+                interrupted = str(e)
+            if cancel_check() and not interrupted:
+                interrupted = "Stopped by user during metadata"
 
         # STAGE 3 transcripts
-        set_stage(
-            "transcripts",
-            f"{len(video_ids)} videos, pacing={cfg.get_pacing_range('transcripts')}",
-        )
-        try:
-            # need video infos for title etc.
-            video_infos = list(all_videos.values())
-            fetch_transcripts_bulk(
-                video_infos,
-                out_dir / "transcripts.jsonl",
-                resume=True,
-                progress_cb=progress_cb,
-                cancel_check=cancel_check,
-                throttler=transcripts_throttler,
-                config=cfg,
+        if not interrupted:
+            set_work_stage(
+                "transcripts",
+                len(transcript_remaining),
+                f"{len(transcript_remaining)} remaining, pacing={cfg.get_pacing_range('transcripts')}",
             )
-        except ThrottleAbort as e:
-            _log(f"ThrottleAbort in transcripts: {e}")
-
-        if cancel_check():
-            raise RuntimeError("Cancelled after transcripts")
+            try:
+                video_infos = [
+                    all_videos[video_id] for video_id in transcript_remaining
+                ]
+                fetch_transcripts_bulk(
+                    video_infos,
+                    out_dir / "transcripts.jsonl",
+                    resume=True,
+                    progress_cb=progress_cb,
+                    cancel_check=cancel_check,
+                    throttler=transcripts_throttler,
+                    config=cfg,
+                )
+            except ThrottleAbort as e:
+                interrupted = str(e)
+            if cancel_check() and not interrupted:
+                interrupted = "Stopped by user during transcripts"
 
         # STAGE 4 comments
-        set_stage("comments", f"{len(video_ids)} videos")
-        try:
-            fetch_comments_bulk(
-                video_ids,
-                out_dir / "comments.jsonl",
-                limit_per_video=cfg.comments_per_video,
-                resume=True,
-                progress_cb=progress_cb,
-                throttler=comments_throttler,
-                config=cfg,
-                cancel_check=cancel_check,
-            )
-        except ThrottleAbort as e:
-            _log(f"ThrottleAbort in comments: {e}")
+        if not interrupted:
+            set_work_stage("comments", len(comments_remaining))
+            try:
+                fetch_comments_bulk(
+                    comments_remaining,
+                    out_dir / "comments.jsonl",
+                    limit_per_video=cfg.comments_per_video,
+                    resume=True,
+                    progress_cb=progress_cb,
+                    throttler=comments_throttler,
+                    config=cfg,
+                    cancel_check=cancel_check,
+                )
+            except ThrottleAbort as e:
+                interrupted = str(e)
+            if cancel_check() and not interrupted:
+                interrupted = "Stopped by user during comments"
 
-        if cancel_check():
-            raise RuntimeError("Cancelled after comments")
-
-        # STAGE 5 DB
+        # Always rebuild the database after a user stop or throttle abort so the
+        # dashboard immediately exposes everything flushed to JSONL.
         set_stage("database", "Building FTS and indexes")
-        try:
-            stats = build_db(
-                out_dir,
-                out_dir / CONFIG.db_name,
-                progress_cb=progress_cb,
-                cancel_check=cancel_check,
-            )
-            with LOCK:
-                STATE["stats"] = stats
-        except ThrottleAbort as e:
-            _log(f"ThrottleAbort in database: {e}")
-        except Exception as e:
-            _log(f"DB build error: {e}")
-            logger.exception("DB build error")
+        stats = build_db(
+            out_dir,
+            out_dir / cfg.db_name,
+            progress_cb=progress_cb,
+            cancel_check=None,
+        )
+        with LOCK:
+            STATE["stats"] = stats
 
-        set_stage("done", "All done - data saved")
+        if interrupted:
+            set_stage("stopped", f"{interrupted}. Progress saved; rerun to resume.")
+        else:
+            set_stage("done", "All done - data saved")
 
     except Exception as e:
         _log(f"Archive job error: {e}")
@@ -867,17 +905,27 @@ class Handler(BaseHTTPRequestHandler):
     def _set_headers(self, code: int = 200, ctype: str = "application/json"):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
 
     def do_OPTIONS(self):
-        self._set_headers(200)
+        self._set_headers(405)
 
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/healthz":
+                self._set_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "app": "YouTubeKnowledge",
+                            "root": str(Path(__file__).resolve().parent),
+                        }
+                    ).encode("utf-8")
+                )
+                return
             if parsed.path in ("/", "/index.html"):
                 self._set_headers(200, "text/html; charset=utf-8")
                 self.wfile.write(HTML_PAGE.encode("utf-8"))
@@ -1002,10 +1050,18 @@ class Handler(BaseHTTPRequestHandler):
                 results = []
                 if q and db_path.exists():
                     try:
-                        results = search_search_videos(db_path, q, limit=100)
+                        results = search_search_videos(
+                            db_path, q, search_type="all", limit=100
+                        )
                         # highlight
                         for r in results:
-                            snippet = r.get("snippet") or r.get("description") or ""
+                            snippet = (
+                                r.get("snippet")
+                                or r.get("summary")
+                                or r.get("text")
+                                or r.get("description")
+                                or ""
+                            )
                             r["snippet"] = highlight_search_snippet(snippet, q)
                     except Exception as e:  # noqa: BLE001
                         logger.warning(f"search error: {e}")
@@ -1015,31 +1071,8 @@ class Handler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/failed":
                 out_dir = Path(STATE.get("out_dir") or "output")
-                failures = []
-                for fp in [
-                    out_dir / "failed_transcripts.jsonl",
-                    out_dir / "failed_comments.jsonl",
-                    out_dir / "failed_metadata.jsonl",
-                ]:
-                    if not fp.exists():
-                        continue
-                    try:
-                        with open(fp, encoding="utf-8", errors="ignore") as f:
-                            for line in f:
-                                try:
-                                    j = json.loads(line)
-                                    failures.append(j)
-                                except json.JSONDecodeError:
-                                    continue
-                    except OSError as e:
-                        logger.debug(f"failed read {fp}: {e}")
-                # FIX: dedupe by video_id|type keeping last
-                dedup = {}
-                for f in failures:
-                    dedup[f.get("video_id", "") + "|" + f.get("type", "")] = f
-                failures = list(dedup.values())
-                # sort newest first if timestamp?
-                failures.sort(key=lambda x: x.get("video_id", ""))
+                failures = load_unresolved_failures(out_dir)
+                failures.sort(key=lambda item: item.get("video_id", ""))
                 self._set_headers()
                 self.wfile.write(json.dumps({"failures": failures}).encode("utf-8"))
                 return
@@ -1082,12 +1115,28 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = json.loads(body.decode("utf-8")) if body else {}
         except json.JSONDecodeError:
-            data = {}
+            self._set_headers(400)
+            self.wfile.write(json.dumps({"error": "Invalid JSON body"}).encode("utf-8"))
+            return
+        if not isinstance(data, dict):
+            self._set_headers(400)
+            self.wfile.write(
+                json.dumps({"error": "JSON body must be an object"}).encode("utf-8")
+            )
+            return
 
         try:
             if parsed.path == "/api/archive":
                 urls_raw = data.get("urls", "")
                 options = data.get("options", {})
+                if not isinstance(options, dict):
+                    self._set_headers(400)
+                    self.wfile.write(
+                        json.dumps({"ok": False, "error": "Invalid options"}).encode(
+                            "utf-8"
+                        )
+                    )
+                    return
                 urls = parse_url_input(urls_raw)
                 if not urls:
                     self._set_headers(400)
@@ -1099,18 +1148,31 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 with LOCK:
                     if STATE["running"]:
-                        self._set_headers(400)
+                        self._set_headers(409)
                         self.wfile.write(
-                            json.dumps({
-                                "ok": False,
-                                "error": "Already running",
-                            }).encode("utf-8")
+                            json.dumps(
+                                {
+                                    "ok": False,
+                                    "error": "Already running",
+                                }
+                            ).encode("utf-8")
                         )
                         return
+                    # Reserve the job before starting its thread. Without this,
+                    # two quick clicks could both pass the running check.
+                    STATE["running"] = True
+                    STATE["cancel"] = False
+                    STATE["stage"] = "queued"
+                    STATE["stage_details"] = "Starting archive"
                 t = threading.Thread(
                     target=archive_job, args=(urls, options), daemon=True
                 )
-                t.start()
+                try:
+                    t.start()
+                except Exception:
+                    with LOCK:
+                        STATE["running"] = False
+                    raise
                 self._set_headers()
                 self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
                 return
@@ -1124,6 +1186,12 @@ class Handler(BaseHTTPRequestHandler):
 
             if parsed.path.startswith("/api/video/") and parsed.path.endswith("/score"):
                 vid = parsed.path.split("/")[3]
+                if not is_valid_video_id(vid):
+                    self._set_headers(400)
+                    self.wfile.write(
+                        json.dumps({"error": "Invalid video ID"}).encode("utf-8")
+                    )
+                    return
                 score = data.get("score")
                 notes = data.get("notes", "")
                 out_dir = Path(STATE.get("out_dir") or "output")
@@ -1131,7 +1199,19 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     score_f = float(score) if score is not None else 0.0
                 except (ValueError, TypeError):
-                    score_f = 0.0
+                    self._set_headers(400)
+                    self.wfile.write(
+                        json.dumps({"error": "Score must be a number"}).encode("utf-8")
+                    )
+                    return
+                if not 0 <= score_f <= 100:
+                    self._set_headers(400)
+                    self.wfile.write(
+                        json.dumps({"error": "Score must be between 0 and 100"}).encode(
+                            "utf-8"
+                        )
+                    )
+                    return
                 ok = update_video_user_score(
                     db_path, vid, score_f, notes, out_dir=out_dir
                 )
@@ -1193,7 +1273,9 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # Server start / CLI
 # ---------------------------------------------------------------------------
-def run_server(port: int = DEFAULT_PORT, out_dir: Path = DEFAULT_OUT) -> None:
+def run_server(
+    port: int = DEFAULT_PORT, out_dir: Path = DEFAULT_OUT, open_browser: bool = True
+) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     with LOCK:
@@ -1201,12 +1283,13 @@ def run_server(port: int = DEFAULT_PORT, out_dir: Path = DEFAULT_OUT) -> None:
 
     port = find_free_port(port)
     server_address = ("127.0.0.1", port)
-    httpd = HTTPServer(server_address, Handler)
+    httpd = ThreadingHTTPServer(server_address, Handler)
     url = f"http://127.0.0.1:{port}"
     _log(f"Serving at {url} out_dir={out_dir}")
     print(f"\nOpen {url}\n")
     try:
-        webbrowser.open(url)
+        if open_browser:
+            webbrowser.open(url)
     except Exception as e:  # noqa: BLE001  # noqa: BLE001
         logger.debug(f"webbrowser.open failed: {e}")
 
@@ -1223,34 +1306,45 @@ def main_cli() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--out", type=str, default=str(DEFAULT_OUT))
     parser.add_argument(
+        "--no-browser", action="store_true", help="Don't open a browser automatically"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=0, help="Maximum videos per source (0 = unlimited)"
+    )
+    parser.add_argument(
         "--no-venv", action="store_true", help="Don't auto-create .venv"
     )
     parser.add_argument("--urls", type=str, nargs="*", help="URLs to archive (CLI)")
     args = parser.parse_args()
+    if args.limit < 0:
+        parser.error("limit cannot be negative")
 
     if not args.no_venv:
         _ensure_venv()
 
     miss = _missing()
     if miss:
-        print(f"Missing deps: {miss} -> installing...")
-        if not _install(miss):
-            print("Install failed, try pip install manually")
-            sys.exit(1)
+        print(
+            f"Missing dependencies: {', '.join(miss)}. Run START_YouTubeKnowledge.bat --setup-only --update.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if args.urls:
         # CLI mode
         opts = {
             "out_dir": args.out,
             "pacing": "conservative",
-            "limit": 0,
+            "limit": args.limit,
         }
         urls = []
         for u in args.urls:
             urls.extend(parse_url_input(u))
         archive_job(urls, opts)
     else:
-        run_server(port=args.port, out_dir=Path(args.out))
+        run_server(
+            port=args.port, out_dir=Path(args.out), open_browser=not args.no_browser
+        )
 
 
 if __name__ == "__main__":
