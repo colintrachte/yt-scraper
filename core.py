@@ -196,7 +196,7 @@ def parse_vote_count(v: Any) -> int:
 
 
 def is_valid_video_id(vid: str) -> bool:
-    """Fixed: only length+regex matters. 11-char IDs can start with PL, UU etc."""
+    """Validate the length and character set of a YouTube video ID."""
     if not vid:
         return False
     if len(vid) != 11:
@@ -205,15 +205,42 @@ def is_valid_video_id(vid: str) -> bool:
 
 
 def extract_ids_from_url(url: str) -> Tuple[str | None, str | None]:
+    """Extract a YouTube video and playlist ID from common URL forms."""
     try:
-        parsed = urlparse(url)
+        candidate = (url or "").strip().strip("\"'<>[](){}.,;")
+        if is_valid_video_id(candidate):
+            return candidate, None
+        if "://" not in candidate:
+            candidate = "https://" + candidate.lstrip("/")
+
+        parsed = urlparse(candidate)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        is_short_host = host == "youtu.be" or host.endswith(".youtu.be")
+        is_youtube_host = host in {
+            "youtube.com",
+            "youtube-nocookie.com",
+        } or host.endswith((".youtube.com", ".youtube-nocookie.com"))
+        if not (is_short_host or is_youtube_host):
+            return None, None
+
         qs = parse_qs(parsed.query)
         v = qs.get("v", [None])[0]
         p = qs.get("list", [None])[0]
-        if "youtu.be" in parsed.netloc and parsed.path:
-            possible = parsed.path.lstrip("/").split("/")[0].split("?")[0]
-            if is_valid_video_id(possible):
-                v = possible
+        segments = [segment for segment in parsed.path.split("/") if segment]
+        possible = None
+        if is_short_host and segments:
+            possible = segments[0]
+        elif len(segments) >= 2 and segments[0].lower() in {
+            "embed",
+            "live",
+            "shorts",
+            "v",
+        }:
+            possible = segments[1]
+        if possible and is_valid_video_id(possible):
+            v = possible
+        if not is_valid_video_id(v or ""):
+            v = None
         return v, p
     except Exception as e:  # noqa: BLE001
         logger.debug(f"extract_ids_from_url failed for {url}: {e}")
@@ -225,7 +252,7 @@ def _log(msg: str, cb: ProgressCb = None) -> None:
     if cb:
         try:
             cb(msg)
-        except Exception as e:  # noqa: BLE001  # noqa: BLE001 - progress callback must not crash main flow
+        except Exception as e:  # noqa: BLE001 - callbacks must not stop an archive
             logger.debug(f"progress_cb failed: {e}")
 
 
@@ -281,6 +308,16 @@ YDL_POLITE_OPTS = {
     "extractor_retries": 1,
     "sleep_interval_requests": 1.0,
     "extractor_args": {"youtube": {"skip": ["hls", "dash", "translated_subs"]}},
+}
+
+# Discovery may enumerate a playlist or channel, but remains flat so it does
+# not perform a full metadata request for every entry. Unavailable entries must
+# not prevent the rest of a playlist from being saved.
+YDL_DISCOVERY_OPTS = {
+    **YDL_POLITE_OPTS,
+    "no_playlist": False,
+    "ignoreerrors": True,
+    "extract_flat": "in_playlist",
 }
 
 
@@ -579,7 +616,7 @@ def load_unresolved_failures(out_dir: Path) -> list[Dict[str, Any]]:
             continue
         if category == "comments" and video_id in completed_comments:
             continue
-        unresolved.append(record)
+        unresolved.append({**record, "type": failure_type})
     return unresolved
 
 
@@ -806,7 +843,10 @@ def get_playlist_data(
             x in attempt_url
             for x in ("playlist?list=", "/@", "/channel/", "/c/", "/user/")
         ) or (p_id and p_id in attempt_url)
-        ydl_opts = get_ydl_opts(YDL_POLITE_OPTS, cfg)
+        ydl_opts = get_ydl_opts(YDL_DISCOVERY_OPTS, cfg)
+        if limit:
+            remaining = max(1, limit - len(all_videos))
+            ydl_opts["playlistend"] = remaining
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore[arg-type]
                 info = ydl.extract_info(attempt_url, download=False)
@@ -921,7 +961,7 @@ def get_playlist_data(
     if not all_videos and v_id and is_valid_video_id(v_id):
         all_videos[v_id] = {
             "id": v_id,
-            "title": "",
+            "title": f"Video {v_id} (metadata pending)",
             "url": f"https://www.youtube.com/watch?v={v_id}",
             "channel": "",
             "channel_id": "",
@@ -1253,7 +1293,6 @@ def fetch_transcripts_bulk(
                 logger.info("Transcript fetch cancelled during pacing")
                 break
 
-            # FIXED INDENTATION
             for attempt in range(throttler.max_retries + 1):
                 try:
                     full, segs, lang = _fetch_one_transcript(vid, config=cfg)

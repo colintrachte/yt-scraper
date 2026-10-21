@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -35,6 +36,22 @@ for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
 print(", ".join(missing))
 sys.exit(bool(missing))
 """
+
+
+def source_revision(root: Path) -> str | None:
+    """Fingerprint server code so the launcher never reuses a stale process."""
+    digest = hashlib.sha256()
+    found = False
+    for name in ("main.py", "core.py", "search.py", "requirements.txt"):
+        path = root / name
+        try:
+            content = path.read_bytes()
+        except OSError:
+            continue
+        found = True
+        digest.update(name.encode("utf-8"))
+        digest.update(content)
+    return digest.hexdigest()[:16] if found else None
 
 
 def environment_python(root: Path) -> Path:
@@ -134,7 +151,15 @@ def health_matches(url: str, app: str, root: Path) -> bool:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(url + "/healthz", timeout=0.5) as response:
             data = json.load(response)
-        return data.get("app") == app and data.get("root") == str(root.resolve())
+        expected_revision = source_revision(root)
+        return (
+            data.get("app") == app
+            and data.get("root") == str(root.resolve())
+            and (
+                expected_revision is None
+                or data.get("source_revision") == expected_revision
+            )
+        )
     except (OSError, ValueError, TypeError):
         return False
 

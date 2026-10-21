@@ -6,7 +6,7 @@ Feed it a playlist URL and it scrapes everything in there.
 A single Windows launcher is included.
 
 ### What it does
-- Input: any public playlist or channel URL
+- Input: public video, Shorts, Live, playlist, or channel URLs; `@handles` and bare video IDs also work
 - Output: `transcripts.jsonl + comments.jsonl + archive.db` (SQLite FTS5 searchable by grep and AI)
 
 Stack: yt-dlp, youtube-transcript-api, youtube-comment-downloader, SQLite FTS5, and optional LLM summaries. The shipped Python implementation does not require Node or ytranscript.
@@ -27,6 +27,8 @@ Cost: $0.
    Double-click `START_YouTubeKnowledge.bat` without arguments to open the local dashboard. The optional second argument is a video limit; omitting it uses zero (unlimited).
 
    The browser opens after the server is ready. Existing instances of this checkout are reused, and busy ports get a safe fallback. Keep the console open while using the dashboard; Ctrl+C stops a server started by that console. Diagnostics are in `logs/setup.log` and `logs/server.log`.
+
+   A video record is saved as soon as its ID is discovered, even when YouTube blocks optional metadata, transcript, or comment requests. Partial records remain visible in the dashboard's **Failures** tab and are retried on a later run where appropriate.
 
    ```powershell
    .\START_YouTubeKnowledge.bat --check

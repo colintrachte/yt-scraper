@@ -41,6 +41,7 @@ from core import (
     update_video_user_score,
 )
 from core import get_playlist_data as core_get_playlist_data
+from helper_scripts.launch_support import source_revision
 from search import search as search_search_videos
 
 # ---------------------------------------------------------------------------
@@ -50,9 +51,11 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger("ytkb.main")
+PROJECT_ROOT = Path(__file__).resolve().parent
+SOURCE_REVISION = source_revision(PROJECT_ROOT)
 
 # ---------------------------------------------------------------------------
-# HTML - fixed for XSS + UX notes
+# Dashboard HTML
 # ---------------------------------------------------------------------------
 HTML_PAGE = r"""<!doctype html>
 <html lang="en">
@@ -536,7 +539,8 @@ def find_free_port(preferred: int = DEFAULT_PORT) -> int:
 def parse_url_input(raw: str) -> list[str]:
     if not raw:
         return []
-    # split on comma, newline, spaces, but keep only http(s) or @handle
+    # Accept copied links (including surrounding prose/punctuation), handles,
+    # and bare 11-character video IDs.
     parts: list[str] = []
     for chunk in raw.replace("\r", "\n").split("\n"):
         chunk = chunk.strip()
@@ -549,17 +553,21 @@ def parse_url_input(raw: str) -> list[str]:
                 continue
             # split on whitespace inside chunk (allow "url url")
             for sub in c.split():
-                sub = sub.strip(" ,;")
+                sub = sub.strip(" \t,;\"'<>[](){}")
+                sub = sub.rstrip(".!?")
                 if not sub:
                     continue
-                if sub.startswith(("http://", "https://", "@")):
+                if is_valid_video_id(sub):
+                    parts.append(f"https://www.youtube.com/watch?v={sub}")
+                elif sub.startswith("@") and len(sub) > 1:
+                    parts.append(f"https://www.youtube.com/{sub}")
+                elif sub.startswith(("http://", "https://")) and (
+                    "youtube.com" in sub.lower() or "youtu.be" in sub.lower()
+                ):
                     parts.append(sub)
-                elif "youtube.com" in sub or "youtu.be" in sub:
+                elif "youtube.com" in sub.lower() or "youtu.be" in sub.lower():
                     # add scheme if missing
-                    if not sub.startswith("http"):
-                        parts.append("https://" + sub.lstrip("/"))
-                    else:
-                        parts.append(sub)
+                    parts.append("https://" + sub.lstrip("/"))
     # dedupe preserve order
     seen = set()
     out = []
@@ -653,7 +661,7 @@ def persist_discovery(
 
 
 # ---------------------------------------------------------------------------
-# Archive job - FIXED throttler usage + dedupe
+# Archive job
 # ---------------------------------------------------------------------------
 def archive_job(urls: list[str], opts: dict) -> None:
     out_dir = Path(opts.get("out_dir") or "output")
@@ -690,7 +698,7 @@ def archive_job(urls: list[str], opts: dict) -> None:
     cfg.cookies_file = opts.get("cookies_file") or None
     cfg.proxy = opts.get("proxy") or None
 
-    # separate throttlers per service (FIX)
+    # Each service tracks its own rate-limit history.
     discovery_throttler = make_throttler("discovery", cfg)
     metadata_throttler = make_throttler("metadata", cfg)
     transcripts_throttler = make_throttler("transcripts", cfg)
@@ -886,7 +894,26 @@ def archive_job(urls: list[str], opts: dict) -> None:
         if interrupted:
             set_stage("stopped", f"{interrupted}. Progress saved; rerun to resume.")
         else:
-            set_stage("done", "All done - data saved")
+            unresolved = [
+                failure
+                for failure in load_unresolved_failures(out_dir)
+                if failure.get("video_id") in video_ids
+            ]
+            affected_videos = {failure.get("video_id") for failure in unresolved}
+            with LOCK:
+                STATE["done"] = len(video_ids)
+                STATE["total"] = len(video_ids)
+                STATE["failed"] = len(affected_videos)
+                STATE["ok"] = max(0, len(video_ids) - len(affected_videos))
+            if affected_videos:
+                set_stage(
+                    "done",
+                    f"Saved {len(video_ids)} videos; {len(affected_videos)} have missing data. See Failures for details.",
+                )
+            else:
+                set_stage(
+                    "done", f"Saved {len(video_ids)} videos with no unresolved failures"
+                )
 
     except Exception as e:
         _log(f"Archive job error: {e}")
@@ -921,7 +948,8 @@ class Handler(BaseHTTPRequestHandler):
                     json.dumps(
                         {
                             "app": "YouTubeKnowledge",
-                            "root": str(Path(__file__).resolve().parent),
+                            "root": str(PROJECT_ROOT),
+                            "source_revision": SOURCE_REVISION,
                         }
                     ).encode("utf-8")
                 )
@@ -960,7 +988,7 @@ class Handler(BaseHTTPRequestHandler):
                             stats["playlists"] = cur.fetchone()[0]
                             cur.execute("SELECT AVG(quality_score) FROM videos")
                             stats["avg_quality"] = round(cur.fetchone()[0] or 0, 1)
-                    except Exception as e:  # noqa: BLE001  # noqa: BLE001
+                    except Exception as e:  # noqa: BLE001
                         logger.debug(f"stats error: {e}")
                 else:
                     stats = STATE.get("stats") or {}
@@ -986,7 +1014,7 @@ class Handler(BaseHTTPRequestHandler):
                                 (limit,),
                             )
                             videos = [dict(r) for r in cur.fetchall()]
-                    except Exception as e:  # noqa: BLE001  # noqa: BLE001
+                    except Exception as e:  # noqa: BLE001
                         logger.warning(f"videos api error: {e}")
                 self._set_headers()
                 self.wfile.write(json.dumps({"videos": videos}).encode("utf-8"))
@@ -1290,7 +1318,7 @@ def run_server(
     try:
         if open_browser:
             webbrowser.open(url)
-    except Exception as e:  # noqa: BLE001  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         logger.debug(f"webbrowser.open failed: {e}")
 
     try:

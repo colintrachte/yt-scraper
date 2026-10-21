@@ -124,6 +124,103 @@ class NoDelayThrottler:
         pass
 
 
+@pytest.mark.parametrize(
+    ("url", "expected_video", "expected_playlist"),
+    [
+        ("abcdefghijk", "abcdefghijk", None),
+        ("https://youtu.be/abcdefghijk?si=share", "abcdefghijk", None),
+        ("https://www.youtube.com/watch?v=abcdefghijk", "abcdefghijk", None),
+        ("https://www.youtube.com/shorts/abcdefghijk", "abcdefghijk", None),
+        ("https://www.youtube.com/live/abcdefghijk?feature=share", "abcdefghijk", None),
+        ("https://www.youtube-nocookie.com/embed/abcdefghijk", "abcdefghijk", None),
+        (
+            "https://music.youtube.com/watch?v=abcdefghijk&list=PL_testing",
+            "abcdefghijk",
+            "PL_testing",
+        ),
+    ],
+)
+def test_extract_ids_supports_common_youtube_urls(
+    url, expected_video, expected_playlist
+):
+    assert core.extract_ids_from_url(url) == (expected_video, expected_playlist)
+
+
+def test_parse_url_input_accepts_share_text_handles_and_bare_ids():
+    raw = (
+        "Try (https://www.youtube.com/shorts/abcdefghijk), "
+        "@usefulchannel and lmnopqrstuv."
+    )
+    assert main.parse_url_input(raw) == [
+        "https://www.youtube.com/shorts/abcdefghijk",
+        "https://www.youtube.com/@usefulchannel",
+        "https://www.youtube.com/watch?v=lmnopqrstuv",
+    ]
+
+
+def test_playlist_discovery_uses_flat_playlist_options(monkeypatch):
+    captured = {}
+
+    class FakeYDL:
+        def __init__(self, options):
+            captured.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url, download=False):
+            assert download is False
+            return {
+                "id": "PL_testing",
+                "title": "Playlist",
+                "entries": [{"id": "abcdefghijk", "title": "Saved"}],
+            }
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=FakeYDL))
+    videos, playlists, mappings = core.get_playlist_data(
+        "https://www.youtube.com/playlist?list=PL_testing",
+        limit=5,
+        throttler=NoDelayThrottler(),
+    )
+
+    assert captured["no_playlist"] is False
+    assert captured["ignoreerrors"] is True
+    assert captured["extract_flat"] == "in_playlist"
+    assert captured["playlistend"] == 5
+    assert [video["id"] for video in videos] == ["abcdefghijk"]
+    assert playlists[0]["playlist_id"] == "PL_testing"
+    assert mappings[0]["video_id"] == "abcdefghijk"
+
+
+def test_failed_single_video_discovery_still_returns_visible_placeholder(monkeypatch):
+    class EmptyYDL:
+        def __init__(self, _options):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url, download=False):
+            assert download is False
+
+    monkeypatch.setitem(
+        sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=EmptyYDL)
+    )
+    videos, _, _ = core.get_playlist_data(
+        "https://www.youtube.com/shorts/abcdefghijk",
+        throttler=NoDelayThrottler(),
+    )
+
+    assert videos[0]["id"] == "abcdefghijk"
+    assert "metadata pending" in videos[0]["title"]
+
+
 def test_zero_comment_video_is_completed_and_skipped_on_resume(tmp_path, monkeypatch):
     calls = []
 

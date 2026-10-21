@@ -2,9 +2,13 @@ output/
 videos.txt
 archive.txt
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-work/
 node_modules/
 .env
 *.db
 venv/
+.venv/
 logs/
 .launcher-*/

@@ -42,6 +42,16 @@ def test_dependency_versions_and_missing_packages(tmp_path):
     assert "nonexistent-launcher-test-package" in reason
 
 
+def test_source_revision_changes_with_server_code(tmp_path):
+    main_file = tmp_path / "main.py"
+    main_file.write_text("first", encoding="utf-8")
+    first = support.source_revision(tmp_path)
+    main_file.write_text("second", encoding="utf-8")
+
+    assert first
+    assert support.source_revision(tmp_path) != first
+
+
 def test_ready_environment_does_not_install(tmp_path, monkeypatch):
     python = tmp_path / "python.exe"
     python.touch()
